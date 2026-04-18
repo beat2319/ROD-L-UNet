@@ -57,79 +57,16 @@ print(f"Unique (Island, Date) groups: {len(flightline_groups)}")
 # Maps year -> {'tcc': raster, 'tcc_crs': CRS, 'coastline_reproj': GeoDataFrame}
 tcc_cache = {}
 
-# Island-specific configuration for filtering rules
-ISLAND_CONFIG = {
-    "Hawaii": {
-        "skip_dates": ["05/31/2017", "03/12/2019", "07/03/2019", "12/18/2020", "12/17/2021"],
-        "date_buffer_months": 2
-    },
-    "Lanai": {
-        "skip_dates": ["08/16/2019"],
-        "date_buffer_months": 2
-    },
-    "Maui": {
-        "skip_dates": ["03/22/2016"],
-        "date_buffer_months": 2,
-        "year_2019_allowed": ["01/09/2019", "02/08/2019"]  # Special rule for 2019
-    },
-    "Molokai": {
-        "skip_dates": [],
-        "date_buffer_months": 2
-    }
-}
-
-
-def get_year_from_date_str(date_str: str) -> int:
-    """Extract year from MM/DD/YYYY date string."""
-    return int(date_str.split('/')[-1])
-
-
-def should_skip_flightline(island: str, year: int, start_date_str: str) -> bool:
-    """Returns True if the flightline group should be skipped based on island config."""
-    if island not in ISLAND_CONFIG:
-        return True  # Skip islands not in config
-
-    config = ISLAND_CONFIG[island]
-
-    # Check standard skip dates
-    if start_date_str in config.get("skip_dates", []):
-        return True
-
-    # Special Maui 2019 rule
-    if island == "Maui" and year == 2019:
-        allowed = config.get("year_2019_allowed", [])
-        return start_date_str not in allowed
-
-    return False
-
-
-def get_mortality_date_range(island: str, year: int, start_date_str: str) -> tuple:
-    """
-    Returns (start_date, end_date) tuple for filtering ohia mortality.
-    Uses +/- 2 month buffer around the flightline date.
-    """
-    flight_date = datetime.strptime(start_date_str, '%m/%d/%Y')
-
-    # +/- 2 months
-    start_date = flight_date - relativedelta(months=2)
-    end_date = flight_date + relativedelta(months=2)
-
-    return start_date, end_date
-
-
 # Process each (Island, Date) group
 for (island, date_str), group_df in flightline_groups:
-    year = get_year_from_date_str(date_str)
-
-    # Check if this group should be skipped
-    if should_skip_flightline(island, year, date_str):
-        print(f"\nSkipping {island} on {date_str} - excluded")
-        continue
+    year = int(date_str.split('/')[-1])
 
     print(f"\nProcessing {island} on {date_str} - {len(group_df)} flightlines")
 
     # Get the date range for filtering ohia mortality (±2 months)
-    start_date, end_date = get_mortality_date_range(island, year, date_str)
+    flight_date = datetime.strptime(date_str, '%m/%d/%Y')
+    start_date = flight_date - relativedelta(months=2)
+    end_date = flight_date + relativedelta(months=2)
 
     # Filter ohia_mortality within the date range
     filtered_rod = ohia_mortality[
