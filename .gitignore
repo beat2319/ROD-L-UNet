@@ -1,0 +1,101 @@
+# Spatial Data Files
+*.tif
+*.tiff
+*.geotiff
+*.img
+*.nc
+*.hdf
+*.h5
+*.hdf5
+
+# Vector Data
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.sbn
+*.sbx
+*.gdb
+*.kml
+*.kmz
+*.gpkg
+
+# ML/Data Processing
+data/
+attachments/
+chip_bounds/
+negative_chips/
+*.npy
+*.npz
+*.h5
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.model
+*.ckpt
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+logs/
+
+*.Rhistory

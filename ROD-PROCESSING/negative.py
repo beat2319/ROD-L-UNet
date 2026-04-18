@@ -1,0 +1,234 @@
+import pandas as pd
+import geopandas as gpd
+import os
+import rioxarray
+from dateutil.relativedelta import relativedelta
+import rasterio
+from rasterio.mask import mask
+from rasterio.crs import CRS
+import numpy as np
+from datetime import datetime
+
+# NoData value - outside the 0-100 valid TCC range
+NODATA_VALUE = 255
+
+# Create output directory if it doesn't exist
+output_dir = './attachments/tcc_negative'
+os.makedirs(output_dir, exist_ok=True)
+
+# Load coastline (keep original CRS for now, will reproject to match TCC)
+coastline = gpd.read_file("../ROD-COLLECTION/attachments/Coastline/coastline.geojson")
+
+# Load ohia_mortality (full dataset) from ROD-COLLECTION/attachments/DMSM/
+ohia_mortality = gpd.read_file("../ROD-COLLECTION/attachments/DMSM/ohia_mortality/ohia_mortality.geojson")
+
+# Convert CREATED_DATE from milliseconds to datetime
+ohia_mortality['CREATED_DATE_DT'] = pd.to_datetime(ohia_mortality['CREATED_DATE'], unit='ms')
+
+# Add date string column to ohia_mortality in MM/DD/YYYY format
+ohia_mortality['CREATED_DATE_STR'] = ohia_mortality['CREATED_DATE_DT'].dt.strftime('%m/%d/%Y')
+
+# Load all flightlines
+flightline_dir = './attachments/flightlines'
+flightline_files = [f for f in os.listdir(flightline_dir) if f.endswith('_processed.geojson')]
+
+print(f"Found {len(flightline_files)} flightline files: {flightline_files}")
+
+# Load all flightlines into a single GeoDataFrame
+all_flightlines = []
+for flightline_file in flightline_files:
+    flightline_path = os.path.join(flightline_dir, flightline_file)
+    gdf = gpd.read_file(flightline_path)
+    all_flightlines.append(gdf)
+
+all_flightlines = pd.concat(all_flightlines, ignore_index=True)
+
+# Convert START_DATE to datetime and add formatted date string
+all_flightlines['START_DATE_DT'] = pd.to_datetime(all_flightlines['START_DATE'], unit='ms')
+all_flightlines['DATE_STR'] = all_flightlines['START_DATE_DT'].dt.strftime('%m/%d/%Y')
+
+# Group by (Island, DATE_STR)
+flightline_groups = all_flightlines.groupby(['Island', 'DATE_STR'])
+
+print(f"Total flightlines: {len(all_flightlines)}")
+print(f"Unique (Island, Date) groups: {len(flightline_groups)}")
+
+# Cache for TCC rasters and reprojected coastline per year
+# Maps year -> {'tcc': raster, 'tcc_crs': CRS, 'coastline_reproj': GeoDataFrame}
+tcc_cache = {}
+
+# Island-specific configuration for filtering rules
+ISLAND_CONFIG = {
+    "Hawaii": {
+        "skip_dates": ["05/31/2017", "03/12/2019", "07/03/2019", "12/18/2020", "12/17/2021"],
+        "date_buffer_months": 2
+    },
+    "Lanai": {
+        "skip_dates": ["08/16/2019"],
+        "date_buffer_months": 2
+    },
+    "Maui": {
+        "skip_dates": ["03/22/2016"],
+        "date_buffer_months": 2,
+        "year_2019_allowed": ["01/09/2019", "02/08/2019"]  # Special rule for 2019
+    },
+    "Molokai": {
+        "skip_dates": [],
+        "date_buffer_months": 2
+    }
+}
+
+
+def get_year_from_date_str(date_str: str) -> int:
+    """Extract year from MM/DD/YYYY date string."""
+    return int(date_str.split('/')[-1])
+
+
+def should_skip_flightline(island: str, year: int, start_date_str: str) -> bool:
+    """Returns True if the flightline group should be skipped based on island config."""
+    if island not in ISLAND_CONFIG:
+        return True  # Skip islands not in config
+
+    config = ISLAND_CONFIG[island]
+
+    # Check standard skip dates
+    if start_date_str in config.get("skip_dates", []):
+        return True
+
+    # Special Maui 2019 rule
+    if island == "Maui" and year == 2019:
+        allowed = config.get("year_2019_allowed", [])
+        return start_date_str not in allowed
+
+    return False
+
+
+def get_mortality_date_range(island: str, year: int, start_date_str: str) -> tuple:
+    """
+    Returns (start_date, end_date) tuple for filtering ohia mortality.
+    Uses +/- 2 month buffer around the flightline date.
+    """
+    flight_date = datetime.strptime(start_date_str, '%m/%d/%Y')
+
+    # +/- 2 months
+    start_date = flight_date - relativedelta(months=2)
+    end_date = flight_date + relativedelta(months=2)
+
+    return start_date, end_date
+
+
+# Process each (Island, Date) group
+for (island, date_str), group_df in flightline_groups:
+    year = get_year_from_date_str(date_str)
+
+    # Check if this group should be skipped
+    if should_skip_flightline(island, year, date_str):
+        print(f"\nSkipping {island} on {date_str} - excluded")
+        continue
+
+    print(f"\nProcessing {island} on {date_str} - {len(group_df)} flightlines")
+
+    # Get the date range for filtering ohia mortality (±2 months)
+    start_date, end_date = get_mortality_date_range(island, year, date_str)
+
+    # Filter ohia_mortality within the date range
+    filtered_rod = ohia_mortality[
+        (ohia_mortality['CREATED_DATE_DT'] >= start_date) &
+        (ohia_mortality['CREATED_DATE_DT'] <= end_date)
+    ]
+
+    print(f"  Matching date range: {start_date.strftime('%m/%d/%Y')} to {end_date.strftime('%m/%d/%Y')}")
+    print(f"  Found {len(filtered_rod)} ohia_mortality records in this range")
+
+    if len(filtered_rod) == 0:
+        print(f"  Skipping {island} on {date_str} - no matching mortality records")
+        continue
+
+    # Get TCC raster path for the year
+    tcc_path = f"./attachments/tcc/tcc_124_{year}.tif"
+
+    if not os.path.exists(tcc_path):
+        print(f"  Warning: TCC raster for year {year} not found: {tcc_path}")
+        continue
+
+    # Load TCC and reproject coastline (cached per year for performance)
+    if year not in tcc_cache:
+        print(f"  Loading TCC raster for year {year} into cache...")
+        tcc = rioxarray.open_rasterio(tcc_path)
+        tcc_crs = tcc.rio.crs
+        coastline_reproj = coastline.to_crs(tcc_crs)
+        tcc_cache[year] = {
+            'tcc': tcc,
+            'tcc_crs': tcc_crs,
+            'coastline_reproj': coastline_reproj
+        }
+    else:
+        cached = tcc_cache[year]
+        tcc = cached['tcc']
+        tcc_crs = cached['tcc_crs']
+        coastline_reproj = cached['coastline_reproj']
+
+    print(f"  TCC CRS: {tcc_crs}")
+
+    # Reproject filtered ohia_mortality to match TCC CRS
+    filtered_rod_reproj = filtered_rod.to_crs(tcc_crs)
+
+    # Dissolve filtered ohia_mortality
+    dissolved_rod = filtered_rod_reproj.dissolve()
+
+    # Buffer dissolved ohia_mortality by 500m
+    rod_buffer = dissolved_rod.buffer(500)
+
+    # Create GeoDataFrame with buffered geometry
+    rod_buffer_gdf = gpd.GeoDataFrame(geometry=rod_buffer, crs=tcc_crs)
+    dissolved_buffer = rod_buffer_gdf.dissolve()
+
+    # Clip coastline to buffered ohia_mortality
+    negative_mask = gpd.clip(coastline_reproj, dissolved_buffer)
+
+    print(f"  TCC bounds: {tcc.rio.bounds()}")
+    print(f"  Negative mask bounds: {negative_mask.total_bounds}")
+
+    # Dissolve all flightlines in this group
+    flightlines_reproj = group_df.to_crs(tcc_crs)
+    dissolved_flightlines = flightlines_reproj.dissolve()
+
+    try:
+        # Inverse clip: use all_touched=True and invert=True
+        # invert=True keeps areas OUTSIDE the geometry
+        clipped = tcc.rio.clip(negative_mask.geometry.values, all_touched=True, invert=True)
+
+        # Clip by dissolved flightlines (all flightlines in this group combined)
+        clipped = clipped.rio.clip(dissolved_flightlines.geometry.values, all_touched=True)
+
+    except Exception as e:
+        # If clip fails, skip this group entirely to avoid corrupted output
+        print(f"  Clip error: {e} - skipping {island} on {date_str}")
+        continue
+
+    # Prepare output metadata using CLIPPED raster properties
+    out_meta = {
+        "driver": "GTiff",
+        "height": clipped.rio.height,
+        "width": clipped.rio.width,
+        "count": clipped.rio.count,
+        "dtype": str(clipped.dtype),
+        "crs": str(clipped.rio.crs),
+        "transform": clipped.rio.transform(),
+        "nodata": NODATA_VALUE  # Use dedicated NoData value
+    }
+
+    # Threshold pixels (75-100% canopy cover)
+    pixels = np.asarray(clipped.values)
+    pixels = pixels.astype('float32')
+    new_image = np.ma.masked_outside(pixels, 25, 100)
+
+    # Save output raster with island and date format (island_YYYY-MM-DD)
+    output_date = datetime.strptime(date_str, '%m/%d/%Y').strftime('%Y-%m-%d')
+    output_path = os.path.join(output_dir, f"tcc_negative_{island.lower()}_{output_date}.tif")
+    with rasterio.open(output_path, "w", **out_meta) as dest:
+        dest.write(new_image.filled(NODATA_VALUE))
+
+    print(f"  Saved: {output_path}")
+
+print("\nProcessing complete!")

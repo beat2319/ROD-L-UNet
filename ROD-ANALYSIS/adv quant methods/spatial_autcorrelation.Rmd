@@ -1,0 +1,193 @@
+---
+title: "Code Collapse Demonstration"
+output:
+  html_document:
+    code_folding: hide
+---
+
+## Checking 1st and 2nd Order Trends
+
+-   No need to remove trends from data as the $R^2$ for both $1^{st}$ and $2^{nd}$ explain less than 1% of the variance in the data
+
+```{r trend-analysis, message=FALSE, warning=FALSE}
+library(gstat)
+library(sf)
+library(sp)
+
+# Load data
+hawaii_sf <- st_read("./Hawaii_data/Hawaii.geojson", quiet = TRUE)
+gao_sf <- st_read("./GAO_point_data/2016_htmasked_brown_clipped_centers.geojson", quiet = TRUE)
+
+gao_sp <- as(gao_sf, "Spatial")
+
+# Identify your target column
+target <- "Area"
+
+# Ensure it is numeric (Requirement for dissimilarity calculations)
+gao_sp[[target]] <- as.numeric(gao_sp[[target]])
+
+# Extract coordinates to X and Y columns
+gao_sp$X <- coordinates(gao_sp)[,1]
+gao_sp$Y <- coordinates(gao_sp)[,2]
+
+# Check 1st and 2nd order trends
+trend_check <- lm(Area ~ X + Y, data = as.data.frame(gao_sp))
+summary(trend_check)
+
+trend_check_sq <- lm(Area ~ X + Y + I(X^2) + I(Y^2) + I(X*Y), data = as.data.frame(gao_sp))
+summary(trend_check_sq)
+
+```
+
+## Canopy Spatial Structure
+
+```{r canopy-variogram, message=FALSE}
+library(terra)
+
+# Load Tree Canopy Cover (TCC)
+tcc_2017 <- rast("./Hawaii_data/2017_tcc_hawaii.tif")
+
+# Set zero values to NA directly on the raster
+tcc_2017[tcc_2017 == 0] <- NA
+
+# 1. Take your sample (na.rm = TRUE now safely handles the newly minted NAs)
+tcc_sample <- spatSample(tcc_2017, size = 20000, method = "random", na.rm = TRUE, xy = TRUE)
+
+# 2. RENAME the column immediately
+names(tcc_sample)[3] <- "canopy"
+
+# 3. Clean and convert
+tcc_clean <- na.omit(tcc_sample)
+tcc_sf <- st_as_sf(tcc_clean, coords = c("x", "y"), crs = crs(tcc_2017))
+
+# 4. Run the variogram
+vgm_tcc <- variogram(canopy ~ 1, 
+                     data = tcc_sf, 
+                     cutoff = 1600, 
+                     width = 30)
+
+plot(vgm_tcc, main = "Canopy Spatial Structure: Hawaii")
+```
+
+## Generating Pseudo-Absences (Negatives)
+
+```{r generate-negatives, fig.width=10, fig.height=10, fig.align='center'}
+# Set up the 2x2 plotting grid
+par(mfrow = c(2, 2))
+
+# ==========================================
+# STEP 1: Density Map to Survey Polygon (Figure 1)
+# ==========================================
+density_300m <- rast("./GAO_point_data/2016_htmasked_brown_clipped_300m_countha.tif")
+footprint <- density_300m * 0 + 1
+survey_poly <- as.polygons(footprint) # The broad flight path
+
+terra::plot(density_300m, main = "Step 1: 300m Density Map")
+
+# ==========================================
+# STEP 2: Clip TCC by Survey & Create Forest Polygon (Figure 2)
+# ==========================================
+# 1. Project boundary to match TCC (assuming tcc_2017 exists)
+survey_poly_tcc <- project(survey_poly, crs(tcc_2017))
+
+# 2. Clip TCC to flight path and apply ZERO filtering logic
+tcc_clipped <- terra::crop(tcc_2017, survey_poly_tcc)
+tcc_clipped <- terra::mask(tcc_clipped, survey_poly_tcc)
+tcc_clipped[tcc_clipped <= 0] <- NA # <--- Keep zero filtering logic
+
+# 3. Turn the cleaned TCC (Forest only) into a Polygon
+forest_footprint <- tcc_clipped * 0 + 1
+forest_poly <- as.polygons(forest_footprint)
+
+terra::plot(tcc_clipped, main = "Step 2: 30m TCC (Filtered to Path)")
+
+# ==========================================
+# STEP 3: Sample Pseudo-Absences from Forest TCC (Figure 3)
+# ==========================================
+# Sample points directly from the forest TCC (no DEM needed)
+neg_sample <- spatSample(tcc_clipped, size = 265734, method = "random", na.rm = TRUE, xy = TRUE)
+names(neg_sample)[3] <- "canopy"
+neg_sf <- st_as_sf(na.omit(neg_sample), coords = c("x", "y"), crs = crs(tcc_2017))
+neg_sf$presence <- 0
+
+point_count <- nrow(neg_sf)
+print(paste("Plotting", point_count, "points!"))
+
+# 2. Plot the canopy as the background (dynamically adding the count to the title)
+terra::plot(tcc_clipped, main = paste("Step 3:", point_count, "Forest Sample Points"))
+
+# 3. Plot ALL points on top using high transparency 
+# pch = 16 (solid circle), cex = 0.2 (very small size)
+# rgb(1, 1, 1, 0.05) creates a white color that is 95% transparent
+plot(st_geometry(neg_sf), 
+     add = TRUE, 
+     pch = 16, 
+     cex = 0.2, 
+     col = rgb(0.5, 0, 0.5, alpha = 0.9))
+# ==========================================
+# STEP 4: Plot ROD Presence Points (Figure 4)
+# ==========================================
+# NOTE: Replace 'rod_sf' with the actual variable name of your ROD sf object.
+# Uncomment the transform line if your rod points are not already in crs(tcc_2017)
+gao_sf_proj <- sf::st_transform(gao_sf, crs = sf::st_crs(tcc_clipped))
+
+# 2. Plot the base raster
+terra::plot(tcc_clipped, main = "Step 4: ROD Presence Points")
+
+# 3. Add the points
+# Changed pch from "." to 16 (solid circle) and added cex for size control
+plot(st_geometry(gao_sf_proj), 
+     add = TRUE, 
+     pch = 16, 
+     cex = 0.4, 
+     col = "red")
+```
+
+## Cross-Variogram Formulation
+
+```{r cross-variogram}
+# --- 1. Preparation & Extraction ---
+# Project gao_sf to match tcc_2017 CRS if needed
+gao_sf <- st_transform(gao_sf, crs(tcc_2017))
+pos_sf <- gao_sf
+pos_sf$presence <- 1
+
+# Extract TCC values for presence points
+pos_sf$canopy <- terra::extract(tcc_2017, pos_sf)[,2]
+# neg_sf already has canopy from the sampling step above
+
+# Remove NA values
+pos_sf <- pos_sf[!is.na(pos_sf$canopy), ]
+neg_sf <- neg_sf[!is.na(neg_sf$canopy), ]
+
+# --- 2. Subset & Sample ---
+set.seed(52)
+n_samples <- min(5000, nrow(pos_sf), nrow(neg_sf))
+
+pos_subset <- pos_sf[sample(nrow(pos_sf), n_samples), ]
+neg_subset <- neg_sf[sample(nrow(neg_sf), n_samples), ]
+
+# --- 3. Align & Merge ---
+pos_final <- pos_subset[, c("presence", "canopy")]
+neg_final <- neg_subset[, c("presence", "canopy")]
+
+# Ensure column geometry names match exactly before rbind
+st_geometry(neg_final) <- "geometry"
+
+combined_sf <- rbind(pos_final, neg_final)
+
+# Validate the merge
+table(combined_sf$presence) # Should show an even split of 1s and 0s
+
+# --- 4. Run the Cross-Variogram ---
+g_new <- gstat(NULL, id = "rod", formula = presence ~ 1, data = combined_sf)
+g_new <- gstat(g_new, id = "canopy", formula = canopy ~ 1, data = combined_sf)
+
+vgm_cross_new <- variogram(g_new, cutoff = 1500, width = 60)
+
+plot(vgm_cross_new, main = "Cross-Spatial Structure (30m Lag Bins)")
+
+g_residual <- gstat(NULL, id = "residual", formula = presence ~ canopy, data = combined_sf)
+vgm_residual <- variogram(g_residual, cutoff = 3000, width = 30)
+plot(vgm_residual, main = "presence ~ canopy residual variogram (30m Lag Bins)")
+```
