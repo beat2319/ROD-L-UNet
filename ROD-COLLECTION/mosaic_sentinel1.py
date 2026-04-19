@@ -23,11 +23,11 @@ from osgeo import gdal
 # --- CONFIGURATION ---
 INPUT_DIR = "./attachments/Orbit124_Sentinel1"
 OUTPUT_FILENAME_PATTERN = "{date}_mosaic.tif"  # {date} will be replaced with folder name
-NODATA_VALUE = 0
+NODATA_VALUE = float('nan')  # Use NaN as NoData for ConvLSTM-UNet
 NUM_WORKERS = 6
 GDAL_NUM_THREADS = 2
-COMPRESS = "LZW"  # Options: "LZW" (fast), "DEFLATE" (better but slower)
-YEAR_FILTER = "2015"  # Set to a year string like "2024" to process only that year, or None for all
+COMPRESS = "DEFLATE"  # Options: "LZW" (fast), "DEFLATE" (better but slower)
+YEAR_FILTER = "2016"  # Set to a year string like "2024" to process only that year, or None for all
 
 
 def find_date_folders_with_tifs(input_dir):
@@ -113,12 +113,14 @@ def process_date_folder(args):
     gdal.SetConfigOption('GDAL_NUM_THREADS', str(GDAL_NUM_THREADS))
 
     # Build warp options
-    # dstNodata: treat 0 as nodata (prevents black lines at tile edges - critical for ROD-ML)
+    # srcNodata: ignore NaN values from source tiles to prevent overwriting good data
+    # dstNodata: set NaN as official NoData value for the final mosaic (critical for ROD-ML)
     # creationOptions: compress output to save space and improve I/O
     warp_options = gdal.WarpOptions(
         format='GTiff',
-        dstNodata=NODATA_VALUE,
-        creationOptions=[f'COMPRESS={COMPRESS}'],
+        srcNodata=NODATA_VALUE,  # Ignore NaN values in source files
+        dstNodata=NODATA_VALUE,  # Set NaN as NoData in output
+        creationOptions=[f'COMPRESS={COMPRESS}', 'BIGTIFF=YES'],
         multithread=True
     )
 
@@ -167,7 +169,7 @@ def main():
     # Prepare work items for multiprocessing
     work_items = []
     for date_folder, tif_files in sorted(date_folders.items()):
-        date_name = date_folder.name.replace('(', '').replace(')', '')
+        date_name = date_folder.name.replace('(', '_').replace(')', '')
         output_path = date_folder.parent / OUTPUT_FILENAME_PATTERN.format(date=date_name)
         work_items.append((date_folder, tif_files, output_path))
 
