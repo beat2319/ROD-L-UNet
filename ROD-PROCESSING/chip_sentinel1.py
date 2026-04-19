@@ -1,4 +1,9 @@
 """
+echo $PYTHONPATH
+    if opt/OTB, then
+unset PYTHONPATH
+
+
 Sentinel-1 Chipping Script for ROD Conv-LSTM Training
 
 Extracts temporal stacks of Sentinel-1 SAR chips (VV, VH, RVI) from patch

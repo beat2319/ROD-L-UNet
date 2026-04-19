@@ -106,7 +106,7 @@ def generate_patch_grid(bounds, config: PatchConfig):
         config: Configuration object
 
     Yields:
-        (patch_id, patch_box) for each grid cell
+        (patch_id, patch_box, center_x, center_y) for each grid cell
     """
     minx, miny, maxx, maxy = bounds
 
@@ -136,7 +136,10 @@ def generate_patch_grid(bounds, config: PatchConfig):
                 y + config.PATCH_SIZE_M
             )
 
-            yield patch_id, patch_box
+            center_x = x + config.PATCH_SIZE_M / 2
+            center_y = y + config.PATCH_SIZE_M / 2
+
+            yield patch_id, patch_box, center_x, center_y
             patch_id += 1
 
 
@@ -150,7 +153,7 @@ def build_patches(input_file, config: PatchConfig, positive_gdf=None):
         positive_gdf: Optional GeoDataFrame with positive (ROD) polygons to exclude
 
     Returns:
-        Tuple of (GeoDataFrame with patch bounds, total_patches_generated, patches_filtered_nodata, patches_filtered_positive)
+        Tuple of (list of feature dictionaries, total_patches_generated, patches_filtered_nodata, patches_filtered_positive)
     """
     # Open raster and keep it open for windowed reads
     with rasterio.open(input_file) as src:
@@ -162,12 +165,12 @@ def build_patches(input_file, config: PatchConfig, positive_gdf=None):
         bounds_tuple = (bounds.left, bounds.bottom, bounds.right, bounds.top)
 
         # Generate patch grid and filter by nodata and positive intersection
-        polygons = []
+        patch_features = []
         total_generated = 0
         patches_filtered_nodata = 0
         patches_filtered_positive = 0
 
-        for patch_id, patch_box in generate_patch_grid(bounds_tuple, config):
+        for patch_id, patch_box, center_x, center_y in generate_patch_grid(bounds_tuple, config):
             total_generated += 1
             # Get patch bounds
             patch_bounds = patch_box.bounds
@@ -193,21 +196,49 @@ def build_patches(input_file, config: PatchConfig, positive_gdf=None):
                 if positive_gdf is not None and patch_intersects_positive(patch_box, positive_gdf):
                     patches_filtered_positive += 1
                 else:
-                    polygons.append(patch_box)
+                    # Create feature for this patch matching positive_patch.py format
+                    patch_features.append({
+                        'type': 'Feature',
+                        'properties': {
+                            'patch_id': patch_id,
+                            'geometry': 'Polygon',
+                            'center_x': center_x,
+                            'center_y': center_y,
+                            'min_x': patch_box.bounds[0],
+                            'min_y': patch_box.bounds[1],
+                            'max_x': patch_box.bounds[2],
+                            'max_y': patch_box.bounds[3]
+                        },
+                        'geometry': patch_box.__geo_interface__
+                    })
             else:
                 patches_filtered_nodata += 1
 
-    # Create GeoDataFrame
-    gdf = gpd.GeoDataFrame(
-        {'geometry': polygons, 'label': "negative"},
-        crs=src_crs
-    )
+    return patch_features, total_generated, patches_filtered_nodata, patches_filtered_positive
 
-    # Reproject to target CRS if needed
-    if gdf.crs != config.TARGET_CRS:
-        gdf = gdf.to_crs(config.TARGET_CRS)
 
-    return gdf, total_generated, patches_filtered_nodata, patches_filtered_positive
+def create_output_file(island: str, date: str, patch_features: list,
+                      output_path: Path, config: PatchConfig):
+    """
+    Create output GeoJSON file containing all patch bounding boxes for a source file.
+
+    Args:
+        island: Island name (e.g., 'hawaii')
+        date: Date string (YYYY-MM-DD format)
+        patch_features: List of feature dictionaries for each patch
+        output_path: Path to save the output file
+        config: Configuration object
+    """
+    output_data = {
+        'type': 'FeatureCollection',
+        'crs': {'type': 'name', 'properties': {'name': 'urn:ogc:def:crs:EPSG::32604'}},
+        'features': patch_features
+    }
+
+    # Save to GeoJSON
+    with open(output_path, 'w') as f:
+        import json
+        json.dump(output_data, f, indent=2)
 
 
 # ============================================================================
@@ -273,11 +304,11 @@ def main():
                 positive_gdf = positive_gdf.to_crs(raster_crs)
 
         # Generate patches with nodata and positive filtering
-        gdf, total_generated, filtered_nodata, filtered_positive = build_patches(
+        patch_features, total_generated, filtered_nodata, filtered_positive = build_patches(
             tif_file, PatchConfig, positive_gdf
         )
 
-        num_patches = len(gdf)
+        num_patches = len(patch_features)
         total_patches_generated += num_patches
         total_patches_filtered_nodata += filtered_nodata
         total_patches_filtered_positive += filtered_positive
@@ -286,10 +317,12 @@ def main():
         output_filename = f"negative_{island}_{date}.geojson"
         output_path = PatchConfig.OUTPUT_DIR / output_filename
 
-        gdf.to_file(output_path, driver="GeoJSON")
-
-        tqdm.write(f"  Saved: {output_filename} ({num_patches} patches, "
-                   f"{filtered_nodata} nodata filtered, {filtered_positive} positive filtered)")
+        if patch_features:
+            create_output_file(island, date, patch_features, output_path, PatchConfig)
+            tqdm.write(f"  Saved: {output_filename} ({num_patches} patches, "
+                       f"{filtered_nodata} nodata filtered, {filtered_positive} positive filtered)")
+        else:
+            tqdm.write(f"  Skipping {output_filename}: no patches generated")
 
     # Print summary
     print()
