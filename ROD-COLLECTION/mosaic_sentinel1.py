@@ -2,32 +2,34 @@
 """
 Mosaic Script for Orbit124_Sentinel1 GeoTIFFs
 
-This script finds GeoTIFF files in the deepest directories (date folders)
-within the Orbit124_Sentinel1 folder and creates a mosaiced file for each
-date folder using GDAL Python API with multiprocessing.
-
-Optimized for 12-core CPU: 6 workers × 2 GDAL threads per worker = 12 cores total.
+Stitches the 4 GeoTIFF tiles per date folder (from Google Earth Engine exports)
+into a single mosaic using rasterio. No Orfeo ToolBox required.
 
 Usage:
     python mosaic_sentinel1.py
+    python mosaic_sentinel1.py  # with YEAR_FILTER set below
 """
 
 import os
 import sys
 from collections import defaultdict
+from multiprocessing import Pool
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
-from osgeo import gdal
+
+import numpy as np
+import rasterio
+from rasterio.merge import merge
 
 
 # --- CONFIGURATION ---
 INPUT_DIR = "./attachments/Orbit124_Sentinel1"
-OUTPUT_FILENAME_PATTERN = "{date}_mosaic.tif"  # {date} will be replaced with folder name
-NODATA_VALUE = float('nan')  # Use NaN as NoData for ConvLSTM-UNet
-NUM_WORKERS = 6
-GDAL_NUM_THREADS = 2
-COMPRESS = "DEFLATE"  # Options: "LZW" (fast), "DEFLATE" (better but slower)
-YEAR_FILTER = "2016"  # Set to a year string like "2024" to process only that year, or None for all
+OUTPUT_FILENAME_PATTERN = "{date}_mosaic.tif"
+NUM_WORKERS = 4              # Use all 4 cores
+GDAL_NUM_THREADS = 8          # 8 GDAL threads per worker = 32 total threads
+YEAR_FILTER = "2016"            # Set to "2016" etc. to filter, or None for all
+COMPRESSION = "DEFLATE"
+TILE_SIZE = 256
+NODATA = 0
 
 
 def find_date_folders_with_tifs(input_dir):
@@ -45,17 +47,13 @@ def find_date_folders_with_tifs(input_dir):
         print(f"ERROR: Input directory does not exist: {input_dir}")
         sys.exit(1)
 
-    # Count starting depth
     start_depth = len(input_path.parts)
-
-    # Track directory depth and contents
-    dir_contents = defaultdict(list)  # dir_path -> list of tif files
+    dir_contents = defaultdict(list)
 
     for root, dirs, files in os.walk(input_dir):
         root_path = Path(root)
         depth = len(root_path.parts) - start_depth
 
-        # Find all .tif/.tiff files in this directory
         tif_files = []
         for f in files:
             if f.lower().endswith(('.tif', '.tiff')):
@@ -64,14 +62,12 @@ def find_date_folders_with_tifs(input_dir):
         if tif_files:
             dir_contents[root_path] = tif_files
 
-    # Find maximum depth that has files
     if not dir_contents:
         print("ERROR: No .tif or .tiff files found in directory tree.")
         sys.exit(1)
 
     max_depth = max(len(p.parts) - start_depth for p in dir_contents.keys())
 
-    # Collect only directories at max depth
     for dir_path, tif_files in dir_contents.items():
         depth = len(dir_path.parts) - start_depth
         if depth == max_depth:
@@ -82,8 +78,7 @@ def find_date_folders_with_tifs(input_dir):
 
 def process_date_folder(args):
     """
-    Worker function to process a single date folder.
-    Runs in a separate process via multiprocessing.Pool.
+    Worker function to mosaic all .tif files in a single date folder.
 
     Args:
         args: Tuple of (date_folder, tif_files, output_path)
@@ -93,7 +88,10 @@ def process_date_folder(args):
     """
     date_folder, tif_files, output_path = args
 
-    # Check if output already exists
+    # Enable GDAL threading for this worker
+    os.environ['GDAL_NUM_THREADS'] = str(GDAL_NUM_THREADS)
+
+    # Skip if output already exists
     if output_path.exists():
         return {
             'status': 'skip',
@@ -109,43 +107,69 @@ def process_date_folder(args):
             'message': f'Expected 4 GeoTIFFs, but found {len(tif_files)}'
         }
 
-    # Set GDAL config for threading
-    gdal.SetConfigOption('GDAL_NUM_THREADS', str(GDAL_NUM_THREADS))
-
-    # Build warp options
-    # srcNodata: ignore NaN values from source tiles to prevent overwriting good data
-    # dstNodata: set NaN as official NoData value for the final mosaic (critical for ROD-ML)
-    # creationOptions: compress output to save space and improve I/O
-    warp_options = gdal.WarpOptions(
-        format='GTiff',
-        srcNodata=NODATA_VALUE,  # Ignore NaN values in source files
-        dstNodata=NODATA_VALUE,  # Set NaN as NoData in output
-        creationOptions=[f'COMPRESS={COMPRESS}', 'BIGTIFF=YES'],
-        multithread=True
-    )
-
-    # Execute warp using GDAL Python API
+    sources = []
     try:
-        gdal.Warp(str(output_path), [str(f) for f in tif_files], options=warp_options)
+        # Open all input files
+        for tif in tif_files:
+            sources.append(rasterio.open(tif))
+
+        # Merge using first-pixel-wins compositing
+        mosaic_array, mosaic_transform = merge(sources, nodata=NODATA)
+
+        # Build output profile from first source
+        src_profile = sources[0].profile
+        out_profile = src_profile.copy()
+        out_profile.update({
+            'driver': 'GTiff',
+            'height': mosaic_array.shape[1],
+            'width': mosaic_array.shape[2],
+            'count': mosaic_array.shape[0],
+            'dtype': 'float32',
+            'transform': mosaic_transform,
+            'nodata': NODATA,
+            'compress': COMPRESSION,
+            'BIGTIFF': 'YES',
+            'tiled': True,
+            'blockxsize': TILE_SIZE,
+            'blockysize': TILE_SIZE,
+        })
+
+        # Write mosaic
+        with rasterio.open(output_path, 'w', **out_profile) as dst:
+            dst.write(mosaic_array.astype(np.float32))
+
+        # Verify output
+        if not output_path.exists():
+            return {
+                'status': 'fail',
+                'folder': str(date_folder),
+                'message': f'Output not found after write: {output_path}'
+            }
+
         return {
             'status': 'success',
             'folder': str(date_folder),
             'message': f'Created {output_path}'
         }
+
     except Exception as e:
         return {
             'status': 'fail',
             'folder': str(date_folder),
-            'message': f'gdal.Warp failed: {str(e)}'
+            'message': f'Error: {str(e)}'
         }
+    finally:
+        for src in sources:
+            src.close()
 
 
 def main():
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Orbit124_Sentinel1 Batch Mosaic Script")
-    print(f"Configuration: {NUM_WORKERS} workers × {GDAL_NUM_THREADS} threads = {NUM_WORKERS * GDAL_NUM_THREADS} cores")
-    print(f"Compression: {COMPRESS}")
-    print("="*60 + "\n")
+    print(f"Configuration: {NUM_WORKERS} workers x {GDAL_NUM_THREADS} GDAL threads = {NUM_WORKERS * GDAL_NUM_THREADS} threads")
+    print(f"Compression: {COMPRESSION}")
+    print(f"NoData: {NODATA}")
+    print("=" * 60 + "\n")
 
     # Find all date folders with .tif files
     date_folders = find_date_folders_with_tifs(INPUT_DIR)
@@ -166,14 +190,14 @@ def main():
 
     print(f"Found {total_folders} date folders with {total_files} total GeoTIFFs\n")
 
-    # Prepare work items for multiprocessing
+    # Prepare work items
     work_items = []
     for date_folder, tif_files in sorted(date_folders.items()):
         date_name = date_folder.name.replace('(', '_').replace(')', '')
         output_path = date_folder.parent / OUTPUT_FILENAME_PATTERN.format(date=date_name)
         work_items.append((date_folder, tif_files, output_path))
 
-    # Process in parallel using multiprocessing.Pool
+    # Process in parallel
     print(f"Processing with {NUM_WORKERS} parallel workers...\n")
 
     success_count = 0
@@ -183,11 +207,7 @@ def main():
     failed_folders = []
 
     with Pool(processes=NUM_WORKERS) as pool:
-        results = []
         for i, result in enumerate(pool.imap_unordered(process_date_folder, work_items), 1):
-            results.append(result)
-
-            # Live progress update (unordered)
             status = result['status'].upper()
             folder_name = Path(result['folder']).name
             print(f"[{i}/{total_folders}] {status}: {folder_name}")
@@ -196,30 +216,31 @@ def main():
                 success_count += 1
             elif result['status'] == 'skip':
                 skip_count += 1
-                skipped_folders.append(result['folder'])
+                skipped_folders.append(result)
             elif result['status'] == 'fail':
                 fail_count += 1
-                failed_folders.append(result['folder'])
+                failed_folders.append(result)
+                print(f"    -> {result['message']}")
 
     # Print summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
     print(f"Total date folders: {total_folders}")
     print(f"Successfully mosaiced: {success_count}")
     print(f"Skipped: {skip_count}")
     print(f"Failed: {fail_count}")
-    print("="*60)
+    print("=" * 60)
 
     if failed_folders:
         print("\nFailed folders:")
-        for folder in failed_folders:
-            print(f"  - {Path(folder).name}")
+        for r in failed_folders:
+            print(f"  - {Path(r['folder']).name}: {r['message']}")
 
     if skipped_folders:
         print("\nSkipped folders:")
-        for folder in skipped_folders[:10]:  # Show first 10
-            print(f"  - {Path(folder).name}")
+        for r in skipped_folders[:10]:
+            print(f"  - {Path(r['folder']).name}: {r['message']}")
         if len(skipped_folders) > 10:
             print(f"  ... and {len(skipped_folders) - 10} more")
 
