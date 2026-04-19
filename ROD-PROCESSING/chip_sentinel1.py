@@ -239,27 +239,23 @@ def clip_and_convert(mosaic_path: Path, bounds: tuple, config: ChipConfig) -> np
             vh = ds.GetRasterBand(2).ReadAsArray().astype(np.float32)
             ds = None  # Close in-memory dataset
 
-    # --- Nodata mask (applied to linear values) ---
-    nodata_mask = (vv == config.NODATA_VALUE) | (vh == config.NODATA_VALUE)
-    nodata_mask |= (vv <= 0) | (vh <= 0)
+    # --- Mosaics are already in dB ---
+    # Nodata: NaN from mosaic, 0 from gdal.Warp dstNodata / rasterio fill_value
+    nodata_mask = np.isnan(vv) | np.isnan(vh) | (vv == 0) | (vh == 0)
+    valid = ~nodata_mask
 
-    # --- RVI from linear values (before dB conversion) ---
-    # RVI = (4 * VH) / (VV + VH)
-    denominator = vv + vh
+    # --- VV_dB and VH_dB: just clip the existing dB values ---
+    vv_db = np.where(valid, np.clip(vv, config.DB_CLIP_MIN, config.DB_CLIP_MAX), np.nan)
+    vh_db = np.where(valid, np.clip(vh, config.DB_CLIP_MIN, config.DB_CLIP_MAX), np.nan)
+
+    # --- RVI from linear values (convert dB back to linear first) ---
+    # RVI = (4 * VH_linear) / (VV_linear + VH_linear)
+    # linear = 10^(dB/10)
+    vv_linear = np.power(10.0, vv / 10.0)
+    vh_linear = np.power(10.0, vh / 10.0)
+    denominator = vv_linear + vh_linear
     rvi = np.full_like(vv, np.nan, dtype=np.float32)
-    valid_linear = ~nodata_mask & (denominator > 0)
-    rvi[valid_linear] = (4.0 * vh[valid_linear]) / denominator[valid_linear]
-
-    # --- Convert VV and VH to dB ---
-    vv_db = np.full_like(vv, np.nan, dtype=np.float32)
-    vh_db = np.full_like(vh, np.nan, dtype=np.float32)
-
-    vv_db[valid_linear] = 10.0 * np.log10(vv[valid_linear])
-    vh_db[valid_linear] = 10.0 * np.log10(vh[valid_linear])
-
-    # Clip dB to reasonable range
-    vv_db = np.clip(vv_db, config.DB_CLIP_MIN, config.DB_CLIP_MAX)
-    vh_db = np.clip(vh_db, config.DB_CLIP_MIN, config.DB_CLIP_MAX)
+    rvi[valid] = (4.0 * vh_linear[valid]) / denominator[valid]
 
     # Stack channels: (3, H, W)
     chip = np.stack([vv_db, vh_db, rvi], axis=0)

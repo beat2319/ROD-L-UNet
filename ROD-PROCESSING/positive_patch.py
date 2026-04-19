@@ -27,6 +27,7 @@ class PatchConfig:
     PATCH_SIZE_M = 2560      # 2560m x 2560m
     OVERLAP_M = 1280         # 1280m overlap (50%)
     STRIDE_M = PATCH_SIZE_M - OVERLAP_M  # 1280m stride
+    PIXEL_RES = 10.0         # 10m pixel resolution (matches Sentinel-1)
 
     # I/O paths
     INPUT_DIR = Path("./attachments/positive")
@@ -72,7 +73,12 @@ def generate_patch_grid(bounds, config: PatchConfig):
     """
     minx, miny, maxx, maxy = bounds
 
-    # Calculate grid dimensions
+    # Snap origins to pixel resolution grid
+    # This ensures alignment with Sentinel-1 10m pixels
+    minx = np.floor(minx / config.PIXEL_RES) * config.PIXEL_RES
+    miny = np.floor(miny / config.PIXEL_RES) * config.PIXEL_RES
+
+    # Calculate grid dimensions (now based on snapped bounds)
     width = maxx - minx
     height = maxy - miny
 
