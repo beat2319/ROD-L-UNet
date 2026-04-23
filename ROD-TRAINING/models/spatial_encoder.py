@@ -40,24 +40,25 @@ class ResNet50Encoder(nn.Module):
                 k = k.replace("module.", "").replace("encoder_q.", "")
                 cleaned[k] = v
 
+            # Remove conv1 from state dict — it has 2 channels (VV/VH)
+            # and we'll manually adapt it to 3 channels below.
+            conv1_weight = cleaned.pop("conv1.weight", None)
+
             backbone.load_state_dict(cleaned, strict=False)
 
-        # Adapt conv1 from 2 channels (pretrained VV/VH) to 3 channels (VV/VH/RVI).
+        # Adapt conv1: create 3-channel version with pretrained 2-channel weights.
         # RVI channel initialized as mean of VV and VH pretrained weights.
-        old_conv1 = backbone.conv1
-        out_ch, in_ch, kH, kW = old_conv1.weight.shape
-        new_conv1 = nn.Conv2d(3, out_ch, kernel_size=kW, stride=2, padding=3, bias=False)
+        new_conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
-        with torch.no_grad():
-            if in_ch == 2:
-                new_conv1.weight[:, :2, :, :] = old_conv1.weight[:, :2, :, :]
-                new_conv1.weight[:, 2, :, :] = (
-                    old_conv1.weight[:, 0, :, :] + old_conv1.weight[:, 1, :, :]
-                ) / 2.0
-            else:
-                # Checkpoint already has 3+ channels or unexpected shape — just copy
-                copy_ch = min(in_ch, 3)
-                new_conv1.weight[:, :copy_ch, :, :] = old_conv1.weight[:, :copy_ch, :, :]
+        if checkpoint_path and conv1_weight is not None:
+            with torch.no_grad():
+                if conv1_weight.shape[1] == 2:
+                    new_conv1.weight[:, :2, :, :] = conv1_weight
+                    new_conv1.weight[:, 2, :, :] = (
+                        conv1_weight[:, 0, :, :] + conv1_weight[:, 1, :, :]
+                    ) / 2.0
+                elif conv1_weight.shape[1] >= 3:
+                    new_conv1.weight[:, :3, :, :] = conv1_weight[:, :3, :, :]
 
         self.stem = nn.Sequential(new_conv1, backbone.bn1, backbone.relu, backbone.maxpool)
         self.layer1 = backbone.layer1  # 256 channels
