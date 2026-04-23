@@ -69,7 +69,7 @@ vgm_tcc <- variogram(canopy ~ 1,
 plot(vgm_tcc, main = "Canopy Spatial Structure: Hawaii")
 ```
 
-## Generating Pseudo-Absences (Negatives)
+## Generating Non-ROD Pseudo-Absences (Negatives)
 
 ```{r generate-negatives, fig.width=10, fig.height=10, fig.align='center'}
 # Set up the 2x2 plotting grid
@@ -102,21 +102,68 @@ forest_poly <- as.polygons(forest_footprint)
 terra::plot(tcc_clipped, main = "Step 2: 30m TCC (Filtered to Path)")
 
 # ==========================================
-# STEP 3: Sample Pseudo-Absences from Forest TCC (Figure 3)
+# STEP 3: Sample Non-ROD Pseudo-Absences (Figure 3)
 # ==========================================
-# Sample points directly from the forest TCC (no DEM needed)
-neg_sample <- spatSample(tcc_clipped, size = 265734, method = "random", na.rm = TRUE, xy = TRUE)
+# Exclude known ROD pixels before sampling pseudo-absences.
+gao_sf_tcc <- sf::st_transform(gao_sf, crs = terra::crs(tcc_clipped))
+
+if (terra::is.lonlat(tcc_clipped)) {
+  stop("tcc_clipped must use a projected CRS before applying a meter-based ROD exclusion buffer.")
+}
+
+rod_exclusion_distance_m <- 30
+
+rod_buffer <- sf::st_buffer(
+  sf::st_geometry(gao_sf_tcc),
+  dist = rod_exclusion_distance_m
+)
+
+rod_buffer_sf <- sf::st_sf(
+  rod_mask = 1,
+  geometry = rod_buffer
+)
+
+rod_mask <- terra::rasterize(
+  terra::vect(rod_buffer_sf),
+  tcc_clipped,
+  field = "rod_mask",
+  background = NA,
+  touches = TRUE
+)
+
+non_rod_tcc <- tcc_clipped
+non_rod_tcc[!is.na(rod_mask)] <- NA
+
+non_rod_cell_count <- as.integer(
+  terra::global(!is.na(non_rod_tcc), "sum", na.rm = TRUE)[1, 1]
+)
+
+pseudo_absence_target_n <- 265734
+neg_sample_size <- min(pseudo_absence_target_n, non_rod_cell_count)
+stopifnot(neg_sample_size > 0)
+
+set.seed(52)
+neg_sample <- spatSample(non_rod_tcc, size = neg_sample_size, method = "random", na.rm = TRUE, xy = TRUE)
 names(neg_sample)[3] <- "canopy"
 neg_sf <- st_as_sf(na.omit(neg_sample), coords = c("x", "y"), crs = crs(tcc_2017))
 neg_sf$presence <- 0
 
+neg_rod_overlap <- terra::extract(rod_mask, terra::vect(neg_sf))[, 2]
+stopifnot(all(is.na(neg_rod_overlap)))
+
 point_count <- nrow(neg_sf)
-print(paste("Plotting", point_count, "points!"))
+print(paste(
+  "Generated",
+  point_count,
+  "non-ROD pseudo-absence points outside",
+  rod_exclusion_distance_m,
+  "m buffered known ROD areas."
+))
 
-# 2. Plot the canopy as the background (dynamically adding the count to the title)
-terra::plot(tcc_clipped, main = paste("Step 3:", point_count, "Forest Sample Points"))
+# 2. Plot the non-ROD sampling surface as the background
+terra::plot(non_rod_tcc, main = paste("Step 3:", "Non-ROD Pseudo-Absences"))
 
-# 3. Plot ALL points on top using high transparency 
+# 3. Plot non-ROD pseudo-absence points on top using high transparency 
 # pch = 16 (solid circle), cex = 0.2 (very small size)
 # rgb(1, 1, 1, 0.05) creates a white color that is 95% transparent
 plot(st_geometry(neg_sf), 
@@ -128,8 +175,8 @@ plot(st_geometry(neg_sf),
 # STEP 4: Plot ROD Presence Points (Figure 4)
 # ==========================================
 # NOTE: Replace 'rod_sf' with the actual variable name of your ROD sf object.
-# Uncomment the transform line if your rod points are not already in crs(tcc_2017)
-gao_sf_proj <- sf::st_transform(gao_sf, crs = sf::st_crs(tcc_clipped))
+# ROD points already projected to match tcc_clipped above.
+gao_sf_proj <- gao_sf_tcc
 
 # 2. Plot the base raster
 terra::plot(tcc_clipped, main = "Step 4: ROD Presence Points")
@@ -143,33 +190,121 @@ plot(st_geometry(gao_sf_proj),
      col = "red")
 ```
 
-## Cross-Variogram Formulation
+## 30 m Positive/Negative Sampling Grid
 
-```{r cross-variogram}
-# --- 1. Preparation & Extraction ---
+This view zooms into a 1.6 km window so the 30 m buffer logic is visible: green cells are eligible non-ROD pseudo-absence candidates, and red cells are 30 m ROD-positive/excluded cells.
+
+```{r sampling-grid-30m, fig.width=10, fig.height=9, fig.align='center'}
+# --- 1. Choose a reproducible ROD-centered 1.6 km window ---
+grid_resolution_m <- 30
+rod_xy <- sf::st_coordinates(sf::st_geometry(gao_sf_proj))
+zoom_center <- rod_xy[
+  which.min((rod_xy[, "X"] - median(rod_xy[, "X"]))^2 +
+              (rod_xy[, "Y"] - median(rod_xy[, "Y"]))^2),
+  c("X", "Y")
+]
+
+zoom_radius_wide <- 800
+zoom_ext_wide <- terra::ext(
+  zoom_center[1] - zoom_radius_wide,
+  zoom_center[1] + zoom_radius_wide,
+  zoom_center[2] - zoom_radius_wide,
+  zoom_center[2] + zoom_radius_wide
+)
+
+zoom_xmin <- zoom_center[1] - zoom_radius_wide
+zoom_xmax <- zoom_center[1] + zoom_radius_wide
+zoom_ymin <- zoom_center[2] - zoom_radius_wide
+zoom_ymax <- zoom_center[2] + zoom_radius_wide
+
+# --- 2. Build a 30 m grid for this window ---
+tcc_zoom <- terra::crop(tcc_clipped, zoom_ext_wide)
+tcc_30m_template <- terra::rast(
+  terra::ext(tcc_zoom),
+  resolution = grid_resolution_m,
+  crs = terra::crs(tcc_zoom)
+)
+tcc_30m <- terra::resample(tcc_zoom, tcc_30m_template, method = "near")
+
+tcc_30m <- terra::mask(tcc_30m, survey_poly_tcc)
+tcc_30m[tcc_30m <= 0] <- NA
+
+# --- 3. Rasterize the ROD exclusion mask directly onto the 30 m grid ---
+zoom_bbox <- sf::st_bbox(
+  c(
+    xmin = zoom_xmin,
+    ymin = zoom_ymin,
+    xmax = zoom_xmax,
+    ymax = zoom_ymax
+  ),
+  crs = sf::st_crs(gao_sf_proj)
+)
+
+rod_buffer_zoom_sf <- suppressWarnings(sf::st_crop(rod_buffer_sf, zoom_bbox))
+
+if (nrow(rod_buffer_zoom_sf) > 0) {
+  rod_mask_30m <- terra::rasterize(
+    terra::vect(rod_buffer_zoom_sf),
+    tcc_30m,
+    field = "rod_mask",
+    background = NA,
+    touches = TRUE
+  )
+} else {
+  rod_mask_30m <- tcc_30m * NA
+}
+
+# --- 4. Encode categorical sampling logic with stable values and colors ---
+viz_logic <- tcc_30m * 0
+viz_logic[!is.na(tcc_30m)] <- 1
+viz_logic[!is.na(rod_mask_30m)] <- 2
+names(viz_logic) <- "sampling_logic"
+
+viz_logic <- as.factor(viz_logic)
+levels(viz_logic) <- data.frame(
+  ID = c(1, 2),
+  Status = c("Candidate negative", "ROD positive/excluded")
+)
+
+# --- 5. Plot the categorical cells only ---
+old_par <- par(no.readonly = TRUE)
+par(mfrow = c(1, 1), mar = c(4, 4, 4, 2))
+
+sampling_cols <- c("#2e7d32", "#c62828")
+
+terra::plot(
+  viz_logic,
+  col = sampling_cols,
+  ext = zoom_ext_wide,
+  legend = FALSE,
+  axes = TRUE,
+  main = "30 m Positive/Negative Sampling Grid"
+)
+
+par(old_par)
+```
+
+## Suspect ROD Indicator Semivariogram
+
+```{r suspect-rod-semivariogram}
+library(ggplot2)
+
+# --- 1. Preparation ---
 # Project gao_sf to match tcc_2017 CRS if needed
 gao_sf <- st_transform(gao_sf, crs(tcc_2017))
 pos_sf <- gao_sf
 pos_sf$presence <- 1
 
-# Extract TCC values for presence points
-pos_sf$canopy <- terra::extract(tcc_2017, pos_sf)[,2]
-# neg_sf already has canopy from the sampling step above
-
-# Remove NA values
-pos_sf <- pos_sf[!is.na(pos_sf$canopy), ]
-neg_sf <- neg_sf[!is.na(neg_sf$canopy), ]
-
 # --- 2. Subset & Sample ---
 set.seed(52)
-n_samples <- min(5000, nrow(pos_sf), nrow(neg_sf))
+n_samples <- min(2000, nrow(pos_sf), nrow(neg_sf))
 
 pos_subset <- pos_sf[sample(nrow(pos_sf), n_samples), ]
 neg_subset <- neg_sf[sample(nrow(neg_sf), n_samples), ]
 
 # --- 3. Align & Merge ---
-pos_final <- pos_subset[, c("presence", "canopy")]
-neg_final <- neg_subset[, c("presence", "canopy")]
+pos_final <- pos_subset[, "presence"]
+neg_final <- neg_subset[, "presence"]
 
 # Ensure column geometry names match exactly before rbind
 st_geometry(neg_final) <- "geometry"
@@ -177,17 +312,150 @@ st_geometry(neg_final) <- "geometry"
 combined_sf <- rbind(pos_final, neg_final)
 
 # Validate the merge
-table(combined_sf$presence) # Should show an even split of 1s and 0s
+stopifnot(all(c(0, 1) %in% combined_sf$presence))
 
-# --- 4. Run the Cross-Variogram ---
-g_new <- gstat(NULL, id = "rod", formula = presence ~ 1, data = combined_sf)
-g_new <- gstat(g_new, id = "canopy", formula = canopy ~ 1, data = combined_sf)
+# --- 4. Run the Suspect ROD Indicator Semivariogram ---
+rod_variogram_cutoff <- 20000
+rod_variogram_width <- 180
 
-vgm_cross_new <- variogram(g_new, cutoff = 1500, width = 60)
+vgm_suspect_rod <- variogram(
+  presence ~ 1,
+  data = combined_sf,
+  cutoff = rod_variogram_cutoff,
+  width = rod_variogram_width
+)
 
-plot(vgm_cross_new, main = "Cross-Spatial Structure (30m Lag Bins)")
+ggplot(vgm_suspect_rod, aes(x = dist, y = gamma)) +
+  geom_point(
+    shape = 21,
+    size = 3.6,
+    stroke = 0.8,
+    color = "#5a1712",
+    fill = "#912d25"
+  ) +
+  labs(
+    title = "Suspect ROD Indicator Semivariogram",
+    x = "Lag Distance (m)",
+    y = "Semivariance"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = NA, color = NA),
+    panel.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_line(color = "black", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#4d1713"),
+    axis.text = element_text(color = "#4d1713"),
+    plot.title = element_text(color = "#4d1713", face = "bold", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+```
 
-g_residual <- gstat(NULL, id = "residual", formula = presence ~ canopy, data = combined_sf)
-vgm_residual <- variogram(g_residual, cutoff = 3000, width = 30)
-plot(vgm_residual, main = "presence ~ canopy residual variogram (30m Lag Bins)")
+## ROD Area Semivariogram
+
+This ROD-only semivariogram checks whether the mapped ROD patch area has spatial dependence among the positive observations.
+
+```{r rod-area-semivariogram}
+# --- 1. Prepare ROD-only Area Values ---
+rod_area_sf <- sf::st_transform(gao_sf, crs = terra::crs(tcc_clipped))
+rod_area_sf$Area <- as.numeric(rod_area_sf$Area)
+rod_area_sf <- rod_area_sf[!is.na(rod_area_sf$Area), ]
+stopifnot(nrow(rod_area_sf) > 0)
+
+set.seed(52)
+rod_area_sample_n <- min(2000, nrow(rod_area_sf))
+rod_area_sample <- rod_area_sf[sample(nrow(rod_area_sf), rod_area_sample_n), ]
+
+# --- 2. Run ROD Area Semivariogram ---
+vgm_rod_area <- variogram(
+  Area ~ 1,
+  data = rod_area_sample,
+  cutoff = rod_variogram_cutoff,
+  width = rod_variogram_width
+)
+
+ggplot(vgm_rod_area, aes(x = dist, y = gamma)) +
+  geom_point(
+    shape = 21,
+    size = 3.6,
+    stroke = 0.8,
+    color = "#5a1712",
+    fill = "#912d25"
+  ) +
+  labs(
+    title = "ROD Area Semivariogram",
+    x = "Lag Distance (m)",
+    y = "Semivariance"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = NA, color = NA),
+    panel.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_line(color = "black", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#4d1713"),
+    axis.text = element_text(color = "#4d1713"),
+    plot.title = element_text(color = "#4d1713", face = "bold", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+```
+
+## Check for Anisotropy
+
+Directional semivariograms compare spatial structure across compass directions. Similar curves suggest isotropy, while clear separation among directions suggests anisotropy.
+
+```{r suspect-rod-anisotropy}
+# --- 1. Run Directional Semivariograms ---
+anisotropy_directions <- c(0, 45, 90, 135)
+
+vgm_suspect_rod_anisotropy <- variogram(
+  presence ~ 1,
+  data = combined_sf,
+  cutoff = rod_variogram_cutoff,
+  width = rod_variogram_width,
+  alpha = anisotropy_directions
+)
+
+vgm_suspect_rod_anisotropy$direction <- factor(
+  paste0(vgm_suspect_rod_anisotropy$dir.hor, " degrees"),
+  levels = paste0(anisotropy_directions, " degrees")
+)
+
+# --- 2. Plot Directional Semivariograms ---
+ggplot(vgm_suspect_rod_anisotropy, aes(x = dist, y = gamma, color = direction)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    shape = 21,
+    size = 2.8,
+    stroke = 0.7,
+    fill = "white"
+  ) +
+  scale_color_manual(
+    values = c(
+      "0 degrees" = "#912d25",
+      "45 degrees" = "#6f201b",
+      "90 degrees" = "#b8584f",
+      "135 degrees" = "#3f100d"
+    ),
+    name = "Direction"
+  ) +
+  labs(
+    title = "Suspect ROD Indicator Directional Semivariograms",
+    x = "Lag Distance (m)",
+    y = "Semivariance"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "#ead8d6", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#4d1713"),
+    axis.text = element_text(color = "#4d1713"),
+    legend.title = element_text(color = "#4d1713"),
+    legend.text = element_text(color = "#4d1713"),
+    plot.title = element_text(color = "#4d1713", face = "bold", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
 ```

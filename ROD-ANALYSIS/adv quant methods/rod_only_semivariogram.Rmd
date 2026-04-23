@@ -1,0 +1,351 @@
+---
+title: "ROD-Only Semivariogram"
+output:
+  html_document:
+    code_folding: hide
+---
+
+## ROD-Only Area Semivariogram
+
+This notebook uses only the 2016 ROD center points. `Area` is the semivariogram
+response, while the projected point coordinates provide meter-based lag
+distances.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(sf)
+library(gstat)
+library(ggplot2)
+library(knitr)
+
+set.seed(52)
+
+data_path <- "GAO_point_data/2016_htmasked_brown_clipped_centers.geojson"
+output_dir <- "figures"
+dir.create(output_dir, showWarnings = FALSE)
+
+rod_area_cutoff_m <- 3000
+rod_area_width_m <- 180
+rod_area_sample_limit <- 3000
+candidate_models <- c("Sph", "Exp", "Gau", "Mat")
+```
+
+```{r load-rod-data, message=FALSE, warning=FALSE}
+if (!file.exists(data_path)) {
+  stop("Missing ROD data file: ", data_path)
+}
+
+rod_sf <- st_read(data_path, quiet = TRUE)
+
+if (!"Area" %in% names(rod_sf)) {
+  stop("The ROD data must contain an Area column.")
+}
+
+if (is.na(st_crs(rod_sf))) {
+  stop("The ROD data must have a projected CRS so distances are in meters.")
+}
+
+if (st_is_longlat(rod_sf)) {
+  stop("The ROD data uses longitude/latitude coordinates. Reproject before using meter-based lags.")
+}
+
+rod_sf$Area <- as.numeric(rod_sf$Area)
+rod_coords <- st_coordinates(st_geometry(rod_sf))
+rod_sf$X <- rod_coords[, "X"]
+rod_sf$Y <- rod_coords[, "Y"]
+
+rod_area_sf <- rod_sf[
+  !st_is_empty(rod_sf) &
+    is.finite(rod_sf$X) &
+    is.finite(rod_sf$Y) &
+    !is.na(rod_sf$Area),
+]
+
+stopifnot(nrow(rod_area_sf) > 1)
+
+rod_area_sample_n <- min(rod_area_sample_limit, nrow(rod_area_sf))
+rod_area_sample <- rod_area_sf[sample(nrow(rod_area_sf), rod_area_sample_n), ]
+
+analysis_summary <- data.frame(
+  metric = c(
+    "ROD point count",
+    "Sample count",
+    "CRS",
+    "Variogram cutoff",
+    "Lag width"
+  ),
+  value = c(
+    format(nrow(rod_area_sf), big.mark = ","),
+    format(rod_area_sample_n, big.mark = ","),
+    st_crs(rod_area_sf)$input,
+    paste0(format(rod_area_cutoff_m, big.mark = ","), " m"),
+    paste0(format(rod_area_width_m, big.mark = ","), " m")
+  )
+)
+
+kable(analysis_summary)
+```
+
+```{r empirical-area-semivariogram, message=FALSE, warning=FALSE}
+vgm_rod_area <- variogram(
+  Area ~ 1,
+  data = rod_area_sample,
+  cutoff = rod_area_cutoff_m,
+  width = rod_area_width_m
+)
+
+stopifnot(nrow(vgm_rod_area) > 0)
+
+head(vgm_rod_area)
+```
+
+```{r fit-area-semivariogram, message=FALSE, warning=FALSE}
+gamma_max <- max(vgm_rod_area$gamma, na.rm = TRUE)
+gamma_min <- min(vgm_rod_area$gamma, na.rm = TRUE)
+
+initial_nugget <- max(0, gamma_min * 0.5)
+initial_psill <- max(.Machine$double.eps, gamma_max - initial_nugget)
+initial_range <- rod_area_cutoff_m / 3
+
+fit_one_model <- function(model_name) {
+  initial_model <- vgm(
+    psill = initial_psill,
+    model = model_name,
+    range = initial_range,
+    nugget = initial_nugget
+  )
+
+  fit <- try(
+    suppressWarnings(fit.variogram(vgm_rod_area, initial_model)),
+    silent = TRUE
+  )
+
+  if (inherits(fit, "try-error") || any(is.na(fit$psill)) || any(fit$psill < 0)) {
+    return(NULL)
+  }
+
+  fit
+}
+
+rod_area_fits <- Filter(
+  Negate(is.null),
+  lapply(candidate_models, fit_one_model)
+)
+
+stopifnot(length(rod_area_fits) > 0)
+
+rod_area_sse <- sapply(rod_area_fits, function(fit) attr(fit, "SSErr"))
+names(rod_area_sse) <- sapply(rod_area_fits, function(fit) as.character(fit$model[2]))
+
+rod_area_fit_summary <- data.frame(
+  model = names(rod_area_sse),
+  sse = as.numeric(rod_area_sse)
+)
+rod_area_fit_summary <- rod_area_fit_summary[order(rod_area_fit_summary$sse), ]
+
+rod_area_model <- rod_area_fits[[which.min(rod_area_sse)]]
+rod_area_model_name <- as.character(rod_area_model$model[2])
+rod_area_range_m <- as.numeric(rod_area_model$range[2])
+
+selected_model_summary <- data.frame(
+  selected_model = rod_area_model_name,
+  fitted_range_m = round(rod_area_range_m, 1),
+  cutoff_m = rod_area_cutoff_m,
+  lag_width_m = rod_area_width_m
+)
+
+kable(rod_area_fit_summary)
+kable(selected_model_summary)
+rod_area_model
+```
+
+```{r plot-area-semivariogram, message=FALSE, warning=FALSE, fig.width=9, fig.height=6, fig.align='center'}
+rod_area_fit_line <- variogramLine(
+  rod_area_model,
+  maxdist = rod_area_cutoff_m,
+  dist_vector = seq(0, rod_area_cutoff_m, by = rod_area_width_m)
+)
+
+meter_labels <- function(x) {
+  paste0(format(round(x), big.mark = ","), " m")
+}
+
+range_label <- if (rod_area_range_m <= rod_area_cutoff_m) {
+  paste0("Fitted range = ", format(round(rod_area_range_m), big.mark = ","), " m")
+} else {
+  paste0("Fitted range > ", format(rod_area_cutoff_m, big.mark = ","), " m")
+}
+
+range_label_x <- if (rod_area_range_m <= rod_area_cutoff_m) {
+  min(
+    max(rod_area_range_m + rod_area_cutoff_m * 0.04, rod_area_cutoff_m * 0.12),
+    rod_area_cutoff_m * 0.85
+  )
+} else {
+  rod_area_cutoff_m * 0.08
+}
+
+range_vline_x <- min(rod_area_range_m, rod_area_cutoff_m)
+
+rod_area_plot <- ggplot(vgm_rod_area, aes(x = dist, y = gamma)) +
+  geom_point(
+    aes(size = np),
+    shape = 21,
+    stroke = 0.8,
+    color = "#5a1712",
+    fill = "#912d25",
+    alpha = 0.9
+  ) +
+  geom_line(
+    data = rod_area_fit_line,
+    aes(x = dist, y = gamma),
+    inherit.aes = FALSE,
+    color = "#1f5e5a",
+    linewidth = 1.1
+  ) +
+  geom_vline(
+    xintercept = range_vline_x,
+    color = "#1f5e5a",
+    linewidth = 0.9,
+    linetype = "dashed"
+  ) +
+  annotate(
+    "label",
+    x = range_label_x,
+    y = max(vgm_rod_area$gamma, na.rm = TRUE),
+    label = range_label,
+    hjust = 0,
+    vjust = 1,
+    size = 3.8,
+    color = "#173f3c",
+    fill = "white",
+    label.size = 0.25
+  ) +
+  scale_x_continuous(labels = meter_labels) +
+  scale_size_continuous(name = "Pair count", range = c(1.8, 5.2)) +
+  coord_cartesian(xlim = c(0, rod_area_cutoff_m)) +
+  labs(
+    title = "ROD-Only Area Semivariogram",
+    subtitle = paste0(
+      "2016 ROD centers | best fit: ",
+      rod_area_model_name,
+      " | cutoff = ",
+      format(rod_area_cutoff_m, big.mark = ","),
+      " m, lag width = ",
+      rod_area_width_m,
+      " m"
+    ),
+    x = "Lag Distance (m)",
+    y = "Semivariance of ROD Area"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "#d8e7e5", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#173f3c"),
+    axis.text = element_text(color = "#173f3c"),
+    legend.title = element_text(color = "#173f3c"),
+    legend.text = element_text(color = "#173f3c"),
+    plot.title = element_text(color = "#173f3c", face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "#315f5b", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+ggsave(
+  filename = file.path(output_dir, "rod_only_area_semivariogram_2016.png"),
+  plot = rod_area_plot,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+rod_area_plot
+```
+
+## X/Y Point-Distance Diagnostic
+
+This diagnostic uses only the sampled point coordinates. It is a spacing aid for
+interpreting the ROD point pattern, not a replacement for the `Area`
+semivariogram above.
+
+```{r xy-distance-diagnostic, message=FALSE, warning=FALSE, fig.width=9, fig.height=6, fig.align='center'}
+sample_xy <- st_coordinates(st_geometry(rod_area_sample))
+sample_distance_matrix <- as.matrix(dist(sample_xy))
+diag(sample_distance_matrix) <- Inf
+
+nearest_neighbor_m <- apply(sample_distance_matrix, 1, min)
+nearest_neighbor_summary <- data.frame(
+  metric = c("Minimum", "25th percentile", "Median", "75th percentile", "95th percentile", "Maximum"),
+  distance_m = round(as.numeric(quantile(
+    nearest_neighbor_m,
+    probs = c(0, 0.25, 0.5, 0.75, 0.95, 1),
+    na.rm = TRUE
+  )), 1)
+)
+
+kable(nearest_neighbor_summary)
+
+nearest_neighbor_median <- median(nearest_neighbor_m, na.rm = TRUE)
+
+xy_distance_plot <- ggplot(
+  data.frame(nearest_neighbor_m = nearest_neighbor_m),
+  aes(x = nearest_neighbor_m)
+) +
+  geom_histogram(
+    binwidth = 30,
+    boundary = 0,
+    fill = "#912d25",
+    color = "white",
+    linewidth = 0.25
+  ) +
+  geom_vline(
+    xintercept = nearest_neighbor_median,
+    color = "#1f5e5a",
+    linewidth = 1,
+    linetype = "dashed"
+  ) +
+  annotate(
+    "label",
+    x = nearest_neighbor_median,
+    y = Inf,
+    label = paste0("Median = ", format(round(nearest_neighbor_median), big.mark = ","), " m"),
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 3.8,
+    color = "#173f3c",
+    fill = "white",
+    label.size = 0.25
+  ) +
+  scale_x_continuous(labels = meter_labels) +
+  coord_cartesian(xlim = c(0, rod_area_cutoff_m)) +
+  labs(
+    title = "ROD X/Y Nearest-Neighbor Distance Diagnostic",
+    subtitle = "Distances are computed from the sampled 2016 ROD point coordinates",
+    x = "Nearest-Neighbor Distance (m)",
+    y = "ROD Point Count"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "#ead8d6", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#4d1713"),
+    axis.text = element_text(color = "#4d1713"),
+    plot.title = element_text(color = "#4d1713", face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "#6f201b", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+ggsave(
+  filename = file.path(output_dir, "rod_only_xy_distance_diagnostic_2016.png"),
+  plot = xy_distance_plot,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+xy_distance_plot
+```

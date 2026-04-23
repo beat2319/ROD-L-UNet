@@ -26,7 +26,7 @@ INPUT_DIR = "./attachments/Orbit124_Sentinel1"
 OUTPUT_FILENAME_PATTERN = "{date}_mosaic.tif"
 NUM_WORKERS = 4              # Use all 4 cores
 GDAL_NUM_THREADS = 8          # 8 GDAL threads per worker = 32 total threads
-YEAR_FILTER = "2016"            # Set to "2016" etc. to filter, or None for all
+YEAR_FILTER = "2021"            # Set to "2016" etc. to filter, or None for all
 COMPRESSION = "DEFLATE"
 TILE_SIZE = 256
 NODATA = 0

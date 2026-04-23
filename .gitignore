@@ -99,3 +99,6 @@ Thumbs.db
 logs/
 
 *.Rhistory
+*.png
+*.csv
+*.pdf
