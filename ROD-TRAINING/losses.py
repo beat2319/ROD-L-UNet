@@ -120,7 +120,7 @@ class DiceLoss(nn.Module):
 
         probs = F.softmax(logits, dim=1)
 
-        weights = self.class_weights.to(logits.device) if self.class_weights else None
+        weights = self.class_weights.to(logits.device) if self.class_weights is not None else None
         total_dice = 0.0
         weight_sum = 0.0
 

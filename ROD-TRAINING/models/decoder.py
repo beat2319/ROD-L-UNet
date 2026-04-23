@@ -56,6 +56,7 @@ class UNetDecoder(nn.Module):
         c1, c2, c3, c4 = encoder_channels
 
         # Decoder blocks: upsample → cat(skip) → conv
+        # f4 at H/32 → d3 at H/16 → d2 at H/8 → d1 at H/4 → d0 at H/2 → final at H
         self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
         self.dec3 = ConvBlock(c3 + c3, c3)
 
@@ -65,11 +66,15 @@ class UNetDecoder(nn.Module):
         self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
         self.dec1 = ConvBlock(c1 + c1, c1)
 
-        # Final upsample to original resolution
+        # H/4 → H/2
         self.up0 = nn.ConvTranspose2d(c1, 64, kernel_size=2, stride=2)
         self.dec0 = ConvBlock(64, 64)
 
-        self.head = nn.Conv2d(64, num_classes, kernel_size=1)
+        # H/2 → H (final upsample to original resolution)
+        self.up_final = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec_final = ConvBlock(32, 32)
+
+        self.head = nn.Conv2d(32, num_classes, kernel_size=1)
 
     def forward(self, encoder_feats: list[torch.Tensor]) -> torch.Tensor:
         """
@@ -81,9 +86,10 @@ class UNetDecoder(nn.Module):
         """
         f1, f2, f3, f4 = encoder_feats
 
-        d3 = self.dec3(torch.cat([self.up3(f4), f3], dim=1))  # (B, 1024, H/8, W/8)
-        d2 = self.dec2(torch.cat([self.up2(d3), f2], dim=1))  # (B, 512, H/4, W/4)
-        d1 = self.dec1(torch.cat([self.up1(d2), f1], dim=1))  # (B, 256, H/2, W/2)
-        d0 = self.dec0(self.up0(d1))                           # (B, 64, H, W)
+        d3 = self.dec3(torch.cat([self.up3(f4), f3], dim=1))  # (B, 1024, H/16, W/16)
+        d2 = self.dec2(torch.cat([self.up2(d3), f2], dim=1))  # (B, 512, H/8, W/8)
+        d1 = self.dec1(torch.cat([self.up1(d2), f1], dim=1))  # (B, 256, H/4, W/4)
+        d0 = self.dec0(self.up0(d1))                           # (B, 64, H/2, W/2)
+        df = self.dec_final(self.up_final(d0))                  # (B, 32, H, W)
 
-        return self.head(d0)
+        return self.head(df)
