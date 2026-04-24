@@ -2,8 +2,8 @@
 Training script for Sentinel-1 change detection model.
 
 Usage:
-    python train.py --manifest manifest.csv --stats sar_normalization_stats.json --checkpoint B2_rn50_moco_0099.pth
-    python train.py --manifest manifest.csv --stats sar_normalization_stats.json --epochs 50 --batch_size 4
+    python train.py --manifest manifest.csv --checkpoint B2_rn50_moco_0099.pth
+    python train.py --manifest manifest.csv --epochs 50 --batch_size 4
 """
 
 import argparse
@@ -42,6 +42,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: optim.Optimizer,
+    scheduler,
     criterion: nn.Module,
     device: torch.device,
     scaler: torch.amp.GradScaler,
@@ -66,6 +67,7 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -117,7 +119,6 @@ def validate(
 def main():
     parser = argparse.ArgumentParser(description="Train S1 change detection model")
     parser.add_argument("--manifest", type=str, required=True)
-    parser.add_argument("--stats", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -136,19 +137,16 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Load manifest and stats
+    # Load manifest
     df = pd.read_csv(args.manifest)
-    with open(args.stats) as f:
-        import json
-        stats = json.load(f)
 
     train_df = df[df["split"] == "train"]
     val_df = df[df["split"] == "val"]
     print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Datasets
-    train_dataset = S1ChangeDataset(train_df, stats, augment=True)
-    val_dataset = S1ChangeDataset(val_df, stats, augment=False)
+    train_dataset = S1ChangeDataset(train_df, augment=True)
+    val_dataset = S1ChangeDataset(val_df, augment=False)
 
     # Balanced sampler for training
     sampler = make_balanced_sampler(train_df)
@@ -201,9 +199,17 @@ def main():
         else:
             decoder_params.append(param)
 
+    encoder_spatial_mid_lr = (args.encoder_lr + args.temporal_lr) / 2
+    max_lrs = [
+        args.encoder_lr,
+        encoder_spatial_mid_lr,
+        args.temporal_lr,
+        args.decoder_lr,
+    ]
+
     optimizer = optim.AdamW([
         {"params": encoder_spatial_low_params, "lr": args.encoder_lr},
-        {"params": encoder_spatial_params, "lr": (args.encoder_lr + args.temporal_lr) / 2},
+        {"params": encoder_spatial_params, "lr": encoder_spatial_mid_lr},
         {"params": temporal_params, "lr": args.temporal_lr},
         {"params": decoder_params, "lr": args.decoder_lr},
     ], weight_decay=1e-2)
@@ -211,7 +217,7 @@ def main():
     # Scheduler
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=args.decoder_lr * 2,
+        max_lr=max_lrs,
         epochs=args.epochs,
         steps_per_epoch=len(train_loader),
     )
@@ -250,12 +256,10 @@ def main():
         # Train
         t0 = time.time()
         train_result = train_one_epoch(
-            model, train_loader, optimizer, criterion, device, scaler, epoch,
+            model, train_loader, optimizer, scheduler, criterion, device, scaler, epoch,
         )
         train_time = time.time() - t0
 
-        # Step scheduler
-        scheduler.step()
         current_lr = optimizer.param_groups[-1]["lr"]
 
         # Validate

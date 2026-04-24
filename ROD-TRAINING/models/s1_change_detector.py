@@ -54,7 +54,7 @@ class S1ChangeDetector(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            x: (B, T, C, H, W) = (B, 6, 3, 256, 256) SAR time series.
+            x: (B, T, C, H, W) = (B, 6, 2, 256, 256) SAR time series.
             doy: (B, T) day-of-year per timestep, or None.
 
         Returns:
@@ -62,9 +62,12 @@ class S1ChangeDetector(nn.Module):
         """
         temporal_emb = None
         if self.use_temporal_encoding and doy is not None:
-            # Use the first sample's DoY (all samples in batch have same dates
-            # after temporal alignment). Shape: (T, encoding_dim)
-            temporal_emb = self.temporal_encoding(doy[0])
+            if doy.ndim != 2 or doy.shape[:2] != x.shape[:2]:
+                raise ValueError(
+                    f"Expected doy with shape (B, T) matching x, got {tuple(doy.shape)} "
+                    f"for input {tuple(x.shape)}"
+                )
+            temporal_emb = self.temporal_encoding(doy)
 
         encoder_feats = self.encoder(x, temporal_emb=temporal_emb)
         return self.decoder(encoder_feats)
