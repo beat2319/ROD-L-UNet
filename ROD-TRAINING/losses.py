@@ -1,5 +1,5 @@
 """
-Combined Focal + Dice loss for change detection.
+Combined Cross-Entropy + Dice losses for change detection.
 
 Both components respect ignore_index=255 (nodata pixels excluded).
 """
@@ -9,25 +9,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class FocalLoss(nn.Module):
+class SmoothedCrossEntropyLoss(nn.Module):
     """
-    Multi-class focal loss with class weights and ignore_index.
+    Multi-class cross-entropy with class weights, label smoothing,
+    and ignore_index support.
 
     Args:
-        alpha: Per-class weights (e.g., [1.0, 5.0]).
-        gamma: Focusing parameter (default 2.0).
+        alpha: Per-class weights (e.g., [1.0, 2.0]).
+        label_smoothing: Label smoothing factor (default 0.05).
         ignore_index: Class label to ignore (default 255).
     """
 
     def __init__(
         self,
         alpha: list[float] | None = None,
-        gamma: float = 2.0,
+        label_smoothing: float = 0.05,
         ignore_index: int = 255,
     ):
         super().__init__()
-        self.gamma = gamma
         self.ignore_index = ignore_index
+        self.label_smoothing = label_smoothing
         self.alpha = torch.tensor(alpha, dtype=torch.float32) if alpha else None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -37,45 +38,26 @@ class FocalLoss(nn.Module):
             targets: (B, H, W) long tensor class labels.
 
         Returns:
-            Scalar focal loss.
+            Scalar cross-entropy loss.
         """
-        num_classes = logits.shape[1]
-
-        # Move alpha to same device
         if self.alpha is not None:
             alpha = self.alpha.to(logits.device)
         else:
             alpha = None
 
-        # Valid pixel mask
         valid = targets != self.ignore_index
-
-        # Clamp targets for gather (replace ignored with 0 temporarily)
-        targets_clamped = targets.clone()
-        targets_clamped[~valid] = 0
-
-        # Log softmax and gather per-class log-probabilities
-        log_probs = F.log_softmax(logits, dim=1)
-        log_pt = log_probs.gather(1, targets_clamped.unsqueeze(1)).squeeze(1)
-        pt = log_pt.exp()
-
-        # Focal weight: (1 - pt)^gamma
-        focal_weight = (1 - pt) ** self.gamma
-
-        # Alpha weight per class
-        if alpha is not None:
-            alpha_weight = alpha[targets_clamped]
-        else:
-            alpha_weight = torch.ones_like(pt)
-
-        # Per-pixel loss, masked to valid pixels only
-        loss = -alpha_weight * focal_weight * log_pt
-        loss = loss[valid]
-
-        if loss.numel() == 0:
+        if int(valid.sum()) == 0:
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-        return loss.mean()
+        loss = F.cross_entropy(
+            logits,
+            targets,
+            weight=alpha,
+            ignore_index=self.ignore_index,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        return loss[valid].mean()
 
 
 class DiceLoss(nn.Module):
@@ -151,18 +133,18 @@ class DiceLoss(nn.Module):
         return 1.0 - total_dice / weight_sum
 
 
-class CombinedFocalDiceLoss(nn.Module):
+class CombinedCrossEntropyDiceLoss(nn.Module):
     """
-    Combined Focal + Dice loss for change detection.
+    Combined cross-entropy + Dice loss for change detection.
 
-    loss = focal_weight * FocalLoss + dice_weight * DiceLoss
+    loss = ce_weight * CrossEntropy + dice_weight * DiceLoss
 
     Args:
         num_classes: Number of output classes (default 2).
-        alpha: Per-class weights for both focal and dice (default [1.0, 5.0]).
-        gamma: Focal focusing parameter (default 2.0).
-        focal_weight: Weight for focal component (default 1.0).
-        dice_weight: Weight for dice component (default 1.0).
+        alpha: Per-class weights for both CE and Dice (default [1.0, 2.0]).
+        label_smoothing: Label smoothing factor for CE (default 0.05).
+        ce_weight: Weight for CE component (default 1.0).
+        dice_weight: Weight for Dice component (default 0.5).
         ignore_index: Class label to ignore (default 255).
     """
 
@@ -170,22 +152,26 @@ class CombinedFocalDiceLoss(nn.Module):
         self,
         num_classes: int = 2,
         alpha: list[float] | None = None,
-        gamma: float = 2.0,
-        focal_weight: float = 1.0,
-        dice_weight: float = 1.0,
+        label_smoothing: float = 0.05,
+        ce_weight: float = 1.0,
+        dice_weight: float = 0.5,
         ignore_index: int = 255,
     ):
         super().__init__()
         if alpha is None:
-            alpha = [1.0, 5.0]
+            alpha = [1.0, 2.0]
 
-        self.focal = FocalLoss(alpha=alpha, gamma=gamma, ignore_index=ignore_index)
+        self.cross_entropy = SmoothedCrossEntropyLoss(
+            alpha=alpha,
+            label_smoothing=label_smoothing,
+            ignore_index=ignore_index,
+        )
         self.dice = DiceLoss(
             num_classes=num_classes,
             class_weights=alpha,
             ignore_index=ignore_index,
         )
-        self.focal_weight = focal_weight
+        self.ce_weight = ce_weight
         self.dice_weight = dice_weight
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -197,6 +183,6 @@ class CombinedFocalDiceLoss(nn.Module):
         Returns:
             Scalar combined loss.
         """
-        f_loss = self.focal(logits, targets)
+        ce_loss = self.cross_entropy(logits, targets)
         d_loss = self.dice(logits, targets)
-        return self.focal_weight * f_loss + self.dice_weight * d_loss
+        return self.ce_weight * ce_loss + self.dice_weight * d_loss
