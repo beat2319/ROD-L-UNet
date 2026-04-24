@@ -105,7 +105,7 @@ class SpatioTemporalEncoder(nn.Module):
     """
     ResNet-50 per date → ConvLSTM across dates at each spatial scale.
 
-    Input:  (B, T, C, H, W) = (B, 6, 3, 256, 256)
+    Input:  (B, T, C, H, W) = (B, 6, 2, 256, 256)
     Output: List of 4 temporally-aggregated feature maps.
 
     If temporal_encoding_dim > 0, expects a doy tensor to produce
@@ -138,8 +138,8 @@ class SpatioTemporalEncoder(nn.Module):
     ) -> list[torch.Tensor]:
         """
         Args:
-            x: (B, T, C, H, W) = (B, 6, 3, 256, 256)
-            temporal_emb: (T, encoding_dim) per-timestep temporal embeddings,
+            x: (B, T, C, H, W) = (B, 6, 2, 256, 256)
+            temporal_emb: (B, T, encoding_dim) per-sample temporal embeddings,
                           or None if no temporal encoding.
 
         Returns:
@@ -163,9 +163,14 @@ class SpatioTemporalEncoder(nn.Module):
 
             # Inject temporal encoding if provided
             if temporal_emb is not None:
-                # temporal_emb: (T, encoding_dim) → (T, B, encoding_dim, H_i, W_i)
-                t_emb = temporal_emb.unsqueeze(1).unsqueeze(3).unsqueeze(4)
-                t_emb = t_emb.expand(-1, B, -1, H_i, W_i)
+                if temporal_emb.shape[:2] != (B, T):
+                    raise ValueError(
+                        "Expected temporal_emb with shape (B, T, encoding_dim), "
+                        f"got {tuple(temporal_emb.shape)} for input {(B, T, C, H, W)}"
+                    )
+                # (B, T, encoding_dim) → (T, B, encoding_dim, H_i, W_i)
+                t_emb = temporal_emb.permute(1, 0, 2).unsqueeze(3).unsqueeze(4)
+                t_emb = t_emb.expand(-1, -1, -1, H_i, W_i)
                 feat_t = torch.cat([feat_t, t_emb], dim=2)  # (T, B, C_i + enc_dim, H_i, W_i)
 
             h_final, _ = lstm(feat_t)  # (B, C_i, H_i, W_i)

@@ -40,16 +40,17 @@ class SinusoidalDoYEncoding(nn.Module):
     def forward(self, doy: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            doy: (T,) day-of-year integers, range [0, 365].
+            doy: (..., T) day-of-year integers, typically in range [1, 366].
 
         Returns:
-            (T, encoding_dim) temporal embeddings.
+            (..., T, encoding_dim) temporal embeddings.
         """
         freqs = torch.arange(self.num_freq, device=doy.device, dtype=torch.float32)
         freqs = (2.0 * math.pi) / (self.max_period ** (freqs / self.num_freq))
 
-        # (T, 1) * (1, num_freq) -> (T, num_freq)
-        angles = doy.unsqueeze(1).float() * freqs.unsqueeze(0)
+        # Broadcast frequency bands across any leading batch dimensions.
+        freq_shape = (1,) * doy.ndim + (self.num_freq,)
+        angles = doy.float().unsqueeze(-1) * freqs.view(freq_shape)
         raw = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
         return self.projection(raw)
