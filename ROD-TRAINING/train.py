@@ -20,7 +20,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset import S1ChangeDataset
-from losses import CombinedFocalDiceLoss
+from losses import CombinedCrossEntropyDiceLoss
 from metrics import ChangeDetectionMetrics
 from models import S1ChangeDetector
 
@@ -42,7 +42,6 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: optim.Optimizer,
-    scheduler,
     criterion: nn.Module,
     device: torch.device,
     scaler: torch.amp.GradScaler,
@@ -67,7 +66,6 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()
 
         total_loss += loss.item()
         num_batches += 1
@@ -130,8 +128,14 @@ def main():
     parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--temporal-lr", type=float, default=5e-5)
     parser.add_argument("--decoder-lr", type=float, default=1e-4)
-    parser.add_argument("--alpha", type=float, nargs="+", default=[1.0, 5.0],
+    parser.add_argument("--alpha", type=float, nargs="+", default=[1.0, 2.0],
                         help="Class weights for loss [healthy, mortality]")
+    parser.add_argument("--label-smoothing", type=float, default=0.05,
+                        help="Label smoothing for cross-entropy")
+    parser.add_argument("--ce-weight", type=float, default=1.0,
+                        help="Weight for cross-entropy component")
+    parser.add_argument("--dice-weight", type=float, default=0.5,
+                        help="Weight for Dice component")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -172,12 +176,12 @@ def main():
     print(f"Parameters: {total_params:,} total, {trainable_params:,} trainable")
 
     # Loss
-    criterion = CombinedFocalDiceLoss(
+    criterion = CombinedCrossEntropyDiceLoss(
         num_classes=2,
         alpha=args.alpha,
-        gamma=2.0,
-        focal_weight=1.0,
-        dice_weight=1.0,
+        label_smoothing=args.label_smoothing,
+        ce_weight=args.ce_weight,
+        dice_weight=args.dice_weight,
         ignore_index=255,
     )
 
@@ -200,13 +204,6 @@ def main():
             decoder_params.append(param)
 
     encoder_spatial_mid_lr = (args.encoder_lr + args.temporal_lr) / 2
-    max_lrs = [
-        args.encoder_lr,
-        encoder_spatial_mid_lr,
-        args.temporal_lr,
-        args.decoder_lr,
-    ]
-
     optimizer = optim.AdamW([
         {"params": encoder_spatial_low_params, "lr": args.encoder_lr},
         {"params": encoder_spatial_params, "lr": encoder_spatial_mid_lr},
@@ -214,12 +211,11 @@ def main():
         {"params": decoder_params, "lr": args.decoder_lr},
     ], weight_decay=1e-2)
 
-    # Scheduler
-    scheduler = optim.lr_scheduler.OneCycleLR(
+    # Decay from the configured starting rates instead of ramping upward.
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        max_lr=max_lrs,
-        epochs=args.epochs,
-        steps_per_epoch=len(train_loader),
+        T_max=args.epochs,
+        eta_min=0.0,
     )
 
     scaler = torch.amp.GradScaler("cuda")
@@ -254,16 +250,16 @@ def main():
         print(f"{'='*60}")
 
         # Train
+        current_lr = optimizer.param_groups[-1]["lr"]
         t0 = time.time()
         train_result = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device, scaler, epoch,
+            model, train_loader, optimizer, criterion, device, scaler, epoch,
         )
         train_time = time.time() - t0
 
-        current_lr = optimizer.param_groups[-1]["lr"]
-
         # Validate
         val_result = validate(model, val_loader, criterion, device)
+        scheduler.step()
 
         # Print results
         print(f"\nTrain | loss={train_result['loss']:.4f} "

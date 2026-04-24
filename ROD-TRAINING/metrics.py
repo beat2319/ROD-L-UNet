@@ -40,6 +40,10 @@ class ChangeDetectionMetrics:
             preds = probs.argmax(dim=1)  # (B, H, W)
 
             valid = targets != self.ignore_index
+            valid_count = int(valid.sum())
+            if valid_count == 0:
+                return
+
             preds_flat = preds[valid].cpu().numpy()
             targets_flat = targets[valid].cpu().numpy()
 
@@ -47,7 +51,7 @@ class ChangeDetectionMetrics:
                 if 0 <= t < self.num_classes and 0 <= p < self.num_classes:
                     self.confusion[t][p] += 1
 
-            self.total_valid += int(valid.sum())
+            self.total_valid += valid_count
 
             # Track max predicted probability for collapse detection
             max_prob = probs.max(dim=1).values[valid].max().item()

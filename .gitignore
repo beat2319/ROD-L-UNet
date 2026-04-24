@@ -102,3 +102,4 @@ logs/
 *.png
 *.csv
 *.pdf
+.syncthing.*.tmp
