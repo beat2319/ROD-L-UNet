@@ -4,7 +4,7 @@
 
 The J-STARS project focuses on detecting and monitoring Rapid 'Ōhi'a Death (ROD) using satellite imagery and deep learning. The project employs a spatio-temporal deep learning approach combining Sentinel-1 SAR data with advanced temporal modeling to identify and track ROD outbreaks across the Hawaiian Archipelago.
 
-**Study Area:**  DMSM flightlines
+**Study Area:** DMSM flightlines
 **Temporal Range:** 6-year longitudinal dataset (2016-2021)
 **Output Classes:** 2 classes (healthy forest, ROD mortality)
 
@@ -15,12 +15,14 @@ The J-STARS project focuses on detecting and monitoring Rapid 'Ōhi'a Death (ROD
 Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aerial surveys, which have several critical limitations:
 
 ### Geographic Bias
+
 - ![Flightline Coverage](Images/flightline_visualization.png)
 - Visibility-constrained mapping creates systemic geographic bias
 - Flight line buffer limited to 1 mile (up to 2 miles with good visibility)
 - Areas outside surveyors' field of view remain unsampled ("geographic information desert")
 
 ### Subjective Boundaries
+
 - ![Aerial Survey Methodology](Images/aerial_survey.svg)
 - No standardized protocol for polygon boundaries
 - "No specified rule regarding how far digitized polygons were from target trees"
@@ -30,34 +32,38 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 - Speed of flight and experience level compound subjectivity
 
 ### Temporal Limitations
+
 - ![Aerial Survey Methodology](Images/DMSM_Surveys.png)
 - Limited annual flightline counts per island
 
 ### Key Citation
-> *"Although aerial sketch surveys are invaluable to forest health monitoring, human error can cause high variability in data collection."* — Odachi (2024)
+
+> _"Although aerial sketch surveys are invaluable to forest health monitoring, human error can cause high variability in data collection."_ — Odachi (2024)
 
 ---
 
 ## Satellite Sensor Comparison
 
 ### Coarse Resolution Satellites
+
 ![SAR vs Optical Comparison](Images/SAR_optical_compare.svg)
 
-| Sensor | Type | Resolution | Revisit Cycle | Limitations |
-|---------|--------|------------|-------------|
-| **Sentinel-1** | SAR (C-band) | 10m | 7-13 days | C-band penetrates top canopy; requires substantial structural change |
-| **Sentinel-2** | Optical | 10m | 5 days | Blocked by cloud cover |
+| Sensor         | Type         | Resolution | Revisit Cycle | Limitations                                                          |
+| -------------- | ------------ | ---------- | ------------- | -------------------------------------------------------------------- |
+| **Sentinel-1** | SAR (C-band) | 10m        | 7-13 days     | C-band penetrates top canopy; requires substantial structural change |
+| **Sentinel-2** | Optical      | 10m        | 5 days        | Blocked by cloud cover                                               |
 
 - **Strengths:** Publicly available, high temporal resolution, island-wide coverage
 - **Weaknesses:** Cannot capture individual detections; limited to large-scale outbreaks
 
 ### High Resolution Satellites
+
 ![high_res](Images/high_resolution.svg)
 
-| Sensor | Type | Resolution | Revisit Cycle | Availability |
-|---------|--------|------------|--------------|
-| **Capella** | SAR (X-band) | 1.2m | 1-2 hours | Not public |
-| **WorldView-2** | Optical | 0.5m | 1.1 days | Not public |
+| Sensor          | Type         | Resolution | Revisit Cycle | Availability |
+| --------------- | ------------ | ---------- | ------------- | ------------ |
+| **Capella**     | SAR (X-band) | 1.2m       | 1-2 hours     | Not public   |
+| **WorldView-2** | Optical      | 0.5m       | 1.1 days      | Not public   |
 
 - **Strengths:** Crown-level visualization, X-band reflects off canopy (subtle structural change)
 - **Weaknesses:** Complex preprocessing, limited access
@@ -67,6 +73,7 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 ## Model Architecture
 
 ### Overview
+
 ![L-UNet Architecture](Images/ROD-L-Unet.svg)
 The model follows an **Encoder-Decoder architecture** with temporal aggregation:
 
@@ -88,6 +95,7 @@ ResNet-50 (spatial) → ConvLSTM (temporal) → U-Net (decoder)
   - Layer 4: (B, 2048, H/32, W/32)
 
 **Key Features:**
+
 - First convolutional layer adapted for SAR input (2 channels VV and VH)
 - Pretrained weights loaded with compatible channel mapping
 - Supports checkpoint loading from SSL4EO-S12
@@ -102,6 +110,7 @@ ResNet-50 (spatial) → ConvLSTM (temporal) → U-Net (decoder)
   - `SpatioTemporalEncoder`: Orchestrates ResNet + ConvLSTM across scales
 
 **Temporal Processing:**
+
 - Applies ConvLSTM at each of 4 spatial scales
 - Aggregates temporal information into per-scale feature maps
 - Optional sinusoidal day-of-year (DoY) encoding injection
@@ -126,6 +135,7 @@ ResNet-50 (spatial) → ConvLSTM (temporal) → U-Net (decoder)
 - **Output:** (B, 2, H, W) logits for binary segmentation
 
 **Decoder Blocks:**
+
 - Double convolution: Conv3x3 + BN + ReLU × 2
 - Optional dropout (configurable, default 0.2)
 
@@ -142,17 +152,17 @@ class S1ChangeDetector:
     - decoder: UNetDecoder
 ```
 
-
 ### Model Comparison Results
 
-| Loss Function | Mean IoU | F1 Mortality | IoU Mortality | 
-|-----------------|----------|----------|------------------------|
-| Focal & Dice | 0.4063 | 0.3857 | 0.2389 |
-| BCE & Dice | 0.4176 | 0.3527 | 0.2141  |
+| Loss Function | Mean IoU | F1 Mortality | IoU Mortality |
+| ------------- | -------- | ------------ | ------------- |
+| Focal & Dice  | 0.4063   | 0.3857       | 0.2389        |
+| BCE & Dice    | 0.4176   | 0.3527       | 0.2141        |
 
 ![eval_map](Images/eval_map.svg)
 
 **Legend:**
+
 - **Red** = Change/mortality (Ground Truth / Prediction)
 - **Dark** = Background (Ground Truth / Prediction)
 - **Gray** = Ignore/nodata (Ground Truth / Prediction)
@@ -167,6 +177,7 @@ class S1ChangeDetector:
 ### Remote Sensing Data
 
 #### Sentinel-1 SAR
+
 - **Orbits:** Three relative orbits (22, 95, 124)
 - **Mode:** Ascending
 - **Repeat Cycle:** 12 days
@@ -176,6 +187,7 @@ class S1ChangeDetector:
   - RVI: Radar Vegetation Index (optional)
 
 **Physical Basis:**
+
 - Radar sensors visualize changes in dielectric content of suspect ROD
 - C-band penetrates top layer of canopy
 - Requires substantial structural change for detection
@@ -184,6 +196,7 @@ class S1ChangeDetector:
 ### Ground Truth
 
 #### DMSM Labeled Dataset
+
 - **Method:** Digital Mobile Sketch Mapping helicopter surveys
 - **Frequency:** Bi-monthly
 - **Visibility Range:** 1-2 miles from flightline
@@ -191,11 +204,13 @@ class S1ChangeDetector:
 - **Protocol:** Areas with ≥10 suspect trees are outlined using freeform polygons
 
 **Caveats:**
+
 - Human error can cause high variability in data collection
 - Inter-observer variability across different surveyors
 - Each island has different survey teams with varying experience levels
 
 #### Chip Specifications
+
 - **Count:** 14,000
 - **Resolution:** 10m per pixel
 - **Size:** 256 × 256 pixels (2.56 km × 2.56 km per chip)
@@ -203,6 +218,7 @@ class S1ChangeDetector:
 - **Balance:** 3:1 positive (ROD) to negative (healthy) ratio
 
 ### Negative Sample Logic
+
 Negative samples constrained using NLCD TCC with 10% threshold to ensure model distinguishes ROD from healthy forest rather than non-forested land.
 
 ---
@@ -212,6 +228,7 @@ Negative samples constrained using NLCD TCC with 10% threshold to ensure model d
 ### Dataset Loader (`dataset.py`)
 
 **Key Features:**
+
 - Temporal reversal (chips saved newest-first, model expects oldest-first)
 - NaN handling and filling
 - Day-of-year computation
@@ -237,40 +254,45 @@ Applied to every training patch:
 ### Training Script (`train.py`)
 
 **Usage:**
+
 ```bash
 python train.py --manifest manifest.csv --checkpoint B2_rn50_moco_0099.pth --epochs 50
 ```
 
 ### Key Training Parameters
 
-| Parameter | Default | Description |
-|-----------|----------|-------------|
-| `--epochs` | 50 | Number of training epochs |
-| `--batch-size` | 4 | Training batch size |
-| `--lr` | 2e-6 | Global learning rate |
-| `--seed` | 42 | Random seed for reproducibility |
-| `--freeze-epochs` | 10 | Epochs to freeze encoder layers 1-2 |
-| `--temporal-encoding-dim` | 32 | DoY encoding dimension |
-| `--loss` | ce_dice | Loss function (ce_dice or focal_dice) |
+| Parameter                 | Default | Description                           |
+| ------------------------- | ------- | ------------------------------------- |
+| `--epochs`                | 50      | Number of training epochs             |
+| `--batch-size`            | 4       | Training batch size                   |
+| `--lr`                    | 2e-6    | Global learning rate                  |
+| `--seed`                  | 42      | Random seed for reproducibility       |
+| `--freeze-epochs`         | 10      | Epochs to freeze encoder layers 1-2   |
+| `--temporal-encoding-dim` | 32      | DoY encoding dimension                |
+| `--loss`                  | ce_dice | Loss function (ce_dice or focal_dice) |
 
 ### Loss Functions (`losses.py`)
 
 #### Combined Cross-Entropy + Dice Loss
+
 ```python
 loss = ce_weight * CrossEntropy + dice_weight * DiceLoss
 ```
 
 **Features:**
+
 - Per-class weights (default: [1.0, 2.0] for healthy/mortality)
 - Label smoothing (default 0.05)
 - Dice loss for segmentation optimization
 
 #### Combined Focal + Dice Loss
+
 ```python
 loss = focal_weight * FocalLoss + dice_weight * DiceLoss
 ```
 
 **Features:**
+
 - Focal loss with configurable gamma (default 2.0)
 - Focuses on hard examples
 - Combined with Dice for spatial coherence
@@ -295,6 +317,7 @@ loss = focal_weight * FocalLoss + dice_weight * DiceLoss
 ### ChangeDetectionMetrics
 
 **Computed Metrics:**
+
 - **Per-class:**
   - IoU (Intersection over Union)
   - F1 Score
@@ -306,13 +329,14 @@ loss = focal_weight * FocalLoss + dice_weight * DiceLoss
   - Accuracy
 - **Diagnostic:**
   - `max_pred_prob`: Collapse detection signal
+
 ---
 
 ## Spatial Analysis Methods
 
 ### Indicator Semivariogram
-### Kriging Comparison
 
+### Kriging Comparison
 
 ## Project Structure
 
@@ -360,28 +384,33 @@ J-STARS/
 ## Key Insights from Literature
 
 ### ROD Disease Progression
+
 - **No predictable temporal pattern:** 3-4 month red-to-brown peak to skeleton
 - **Pulse of mortality** with no rhyme or reason
 - **Possible triggers:** Big wind storm events
 
 ### Survey Limitations
+
 - DMSM survey accuracy decreases near flightline boundaries
 - Use 1-mile buffer for valid predictions
 - Flightline proximity can be used as covariate
 
 ### Future Directions
-- **Alpha Earth Embeddings** 
-- **Clim
+
+- **Alpha Earth Embeddings**
+- \*\*Clim
 - **High Resolution** with $\text{3m}^\text{2}$ X-band TerraXSAR near Kilauea volcano
-	- **Crown level detections** with GAO points and confirmed mortality in DMSM
+  - **Crown level detections** with GAO points and confirmed mortality in DMSM
 - **Positional embeddings** (if using transformer architecture)
 - **Fenceline dataset** available but limited (publication pending on healing after repair)
-	- Likely difficult to get approval
+  - Likely difficult to get approval
+
 ---
 
 ## References
 
 ### Papers and Resources
+
 1. **Odachi, N.** (2024). "High-Resolution Satellite Imagery: An Alternative Method for Detection and Monitoring of Rapid 'Ōhi'a Death in Hawai'i." Publicationslist.org, vol. 14, no. 6.
 2. **O'Neill, C. M. and Peters, S. T.** (2026). "Tracking the Spread of Rapid Ōhi'a Death Using Synthetic Aperture Radar." AIAA SCITECH 2026 Forum.
 3. **Leatherman, L. et al.** (2023). Rapid 'Ōhi'a Death (ROD) Mortality in Hawai'i: Method Assessment and Workflow Development.
@@ -392,16 +421,18 @@ J-STARS/
 8. **Papadomanolaki, M. et al.** (2019). "Detecting Urban Changes with Recurrent Neural Networks from Multitemporal Sentinel-2 Data." arXiv.org.
 
 ### Template and Model Sources
+
 - **IEEE GRSS J-STARS Call for Papers:** [Template](https://www.grss-ieee.org/wp-content/uploads/2025/09/JSTARS_CfP_Templatev3.pdf)
-- **Base Model:** [UNetLSTM]([https://github.com/mpapadomanolaki/multi-task-L-UNet](https://github.com/mpapadomanolaki/UNetLSTM.git))
+- **Base Model:** [UNetLSTM](https://github.com/mpapadomanolaki/UNetLSTM.git))
 - **Pretraining:** SSL4EO-S12 MoCo-v2
 
 ### Expert Contacts
-- **[Kevin Lane](https://geohai.org/members/kevin-lane.html)** Geospatial Machine Learning 
+
+- **[Kevin Lane](https://geohai.org/members/kevin-lane.html)** Geospatial Machine Learning
 - **[Zhongying Wang](https://www.colorado.edu/geography/zhongying-stephen-wang):** Geo AI, Machine Learning
 - **[Sepideh Jalayer](https://www.colorado.edu/geography/sepideh-jalayer):** Remote Sensing, Geo AI
 - **[Nia'a Odachi](https://hilo.hawaii.edu/sdav/people.php):** Rapid ‘Ōhi‘a Death Research Specialist
-- **[Ryan Perroy](https://hilo.hawaii.edu/sdav/people.php):**  Principal Investigator  
+- **[Ryan Perroy](https://hilo.hawaii.edu/sdav/people.php):** Principal Investigator
 - **Brian Tucker:** DMSM methodology, limitations, and flightline data
 - **Nick Vaughn:** GAO high-accuracy point measurements for calibration
 
@@ -410,6 +441,7 @@ J-STARS/
 ## Quick Start
 
 ### Training the Model
+
 ```bash
 cd ROD-TRAINING
 python train.py --manifest manifest.csv \
@@ -420,6 +452,7 @@ python train.py --manifest manifest.csv \
 ```
 
 ### Generating Prediction Mask
+
 ```python
 from models import S1ChangeDetector
 import torch
@@ -443,6 +476,7 @@ with torch.no_grad():
 ## License and Acknowledgments
 
 This project builds upon foundational work in remote sensing of forest health and deep learning for change detection. We acknowledge:
+
 - USDA Forest Service for DMSM data
 - Copernicus Sentinel program for open SAR data
 - SSL4EO-S12 for pretraining weights
