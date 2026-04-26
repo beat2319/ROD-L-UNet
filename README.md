@@ -428,7 +428,7 @@ J-STARS/
 
 ### Collaborators/Contacts
 
-- **[CJ O'Neill](https://cj-oneill.com/)**
+- **[CJ O'Neill](https://cj-oneill.com/)** Time Series Analysis, Radar & Remote Sensing
 - **[Kevin Lane](https://geohai.org/members/kevin-lane.html)** Geospatial Machine Learning
 - **[Zhongying Wang](https://www.colorado.edu/geography/zhongying-stephen-wang):** Geo AI, Machine Learning
 - **[Sepideh Jalayer](https://www.colorado.edu/geography/sepideh-jalayer):** Remote Sensing, Geo AI
