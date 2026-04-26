@@ -426,8 +426,9 @@ J-STARS/
 - **Base Model:** [UNetLSTM](https://github.com/mpapadomanolaki/UNetLSTM.git)
 - **Pretraining:** [SSL4EO-S12 MoCo-v2](https://github.com/zhu-xlab/SSL4EO-S12)
 
-### Expert Contacts
+### Collaborators/Contacts
 
+- **[CJ O'Neill](https://cj-oneill.com/)**
 - **[Kevin Lane](https://geohai.org/members/kevin-lane.html)** Geospatial Machine Learning
 - **[Zhongying Wang](https://www.colorado.edu/geography/zhongying-stephen-wang):** Geo AI, Machine Learning
 - **[Sepideh Jalayer](https://www.colorado.edu/geography/sepideh-jalayer):** Remote Sensing, Geo AI
