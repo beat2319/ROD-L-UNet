@@ -423,8 +423,8 @@ J-STARS/
 ### Template and Model Sources
 
 - **IEEE GRSS J-STARS Call for Papers:** [Template](https://www.grss-ieee.org/wp-content/uploads/2025/09/JSTARS_CfP_Templatev3.pdf)
-- **Base Model:** [UNetLSTM](https://github.com/mpapadomanolaki/UNetLSTM.git))
-- **Pretraining:** SSL4EO-S12 MoCo-v2
+- **Base Model:** [UNetLSTM](https://github.com/mpapadomanolaki/UNetLSTM.git)
+- **Pretraining:** [SSL4EO-S12 MoCo-v2](https://github.com/zhu-xlab/SSL4EO-S12)
 
 ### Expert Contacts
 
