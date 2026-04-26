@@ -1,7 +1,7 @@
 """
 ResNet-50 spatial feature extractor for Sentinel-1 SAR input.
 
-Loads SSL4EO-S12 MoCo-v2 pretrained weights (2-channel VV/VH).
+Loads SSL4EO-S12 MoCo-v2 pretrained weights.
 """
 
 import torch
@@ -11,9 +11,9 @@ from torchvision import models
 
 class ResNet50Encoder(nn.Module):
     """
-    Pretrained ResNet-50 feature extractor for SAR input (2 channels: VV, VH).
+    Pretrained ResNet-50 feature extractor for SAR input.
 
-    Input:  (B, 2, H, W)  -- single-date SAR in dB
+    Input:  (B, C, H, W)  -- single-date SAR in dB
     Output: List of 4 feature maps at progressively lower resolutions:
         [0]: (B, 256, H/4, W/4)   -- from layer1
         [1]: (B, 512, H/8, W/8)   -- from layer2
@@ -21,13 +21,19 @@ class ResNet50Encoder(nn.Module):
         [3]: (B, 2048, H/32, W/32) -- from layer4
     """
 
-    def __init__(self, checkpoint_path: str | None = None):
+    def __init__(self, checkpoint_path: str | None = None, input_channels: int = 2):
         super().__init__()
 
         backbone = models.resnet50(weights=None)
 
-        # Replace default 3-channel conv1 with 2-channel version
-        backbone.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        backbone.conv1 = nn.Conv2d(
+            input_channels,
+            64,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=False,
+        )
 
         if checkpoint_path:
             state_dict = torch.load(checkpoint_path, map_location="cpu")
@@ -42,14 +48,14 @@ class ResNet50Encoder(nn.Module):
                 k = k.replace("module.", "").replace("encoder_q.", "")
                 cleaned[k] = v
 
-            # Load pretrained 2-channel conv1 weights directly
+            # Load any overlapping pretrained input channels directly.
             conv1_weight = cleaned.pop("conv1.weight", None)
             backbone.load_state_dict(cleaned, strict=False)
 
             if conv1_weight is not None:
                 with torch.no_grad():
-                    in_ch = conv1_weight.shape[1]
-                    backbone.conv1.weight.data[:in_ch] = conv1_weight[:in_ch]
+                    in_ch = min(conv1_weight.shape[1], input_channels)
+                    backbone.conv1.weight.data[:, :in_ch] = conv1_weight[:, :in_ch]
 
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
         self.layer1 = backbone.layer1  # 256 channels
@@ -60,7 +66,7 @@ class ResNet50Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
         """
         Args:
-            x: (B, 2, H, W) SAR input for one date.
+            x: (B, C, H, W) SAR input for one date.
 
         Returns:
             List of 4 feature maps [c1, c2, c3, c4].

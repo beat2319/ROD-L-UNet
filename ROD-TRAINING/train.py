@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import csv
+import random
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,12 +21,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from dataset import S1ChangeDataset
-from losses import CombinedCrossEntropyDiceLoss
+from losses import CombinedCrossEntropyDiceLoss, CombinedFocalDiceLoss
 from metrics import ChangeDetectionMetrics
 from models import S1ChangeDetector
 
 
-def make_balanced_sampler(df):
+def make_balanced_sampler(df, generator: torch.Generator | None = None):
     """Create a WeightedRandomSampler for ~50/50 positive/negative balance."""
     labels = (df["label"] == "positive").values.astype(int)
     class_counts = np.bincount(labels)
@@ -35,7 +36,27 @@ def make_balanced_sampler(df):
         weights=sample_weights.tolist(),
         num_samples=len(sample_weights),
         replacement=True,
+        generator=generator,
     )
+
+
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id: int) -> None:
+    """Seed dataloader workers so augmentations are reproducible across runs."""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def train_one_epoch(
@@ -120,26 +141,72 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-6,
+                        help="Global learning rate for all trainable parameters")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducible training")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save-dir", type=str, default="runs")
     parser.add_argument("--freeze-epochs", type=int, default=10,
                         help="Epochs to freeze encoder layers 1-2")
-    parser.add_argument("--encoder-lr", type=float, default=1e-5)
-    parser.add_argument("--temporal-lr", type=float, default=5e-5)
-    parser.add_argument("--decoder-lr", type=float, default=1e-4)
+    parser.add_argument("--encoder-lr", type=float, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--temporal-lr", type=float, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--decoder-lr", type=float, default=None,
+                        help=argparse.SUPPRESS)
     parser.add_argument("--alpha", type=float, nargs="+", default=[1.0, 2.0],
                         help="Class weights for loss [healthy, mortality]")
+    parser.add_argument("--loss", type=str, default="ce_dice",
+                        choices=["ce_dice", "focal_dice"],
+                        help="Segmentation loss to optimize")
     parser.add_argument("--label-smoothing", type=float, default=0.05,
                         help="Label smoothing for cross-entropy")
     parser.add_argument("--ce-weight", type=float, default=1.0,
                         help="Weight for cross-entropy component")
+    parser.add_argument("--focal-weight", type=float, default=1.0,
+                        help="Weight for focal component")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                        help="Focal focusing parameter")
     parser.add_argument("--dice-weight", type=float, default=0.5,
                         help="Weight for Dice component")
+    parser.add_argument("--temporal-encoding-dim", type=int, default=32,
+                        help="Day-of-year encoding dimension (0 disables)")
+    parser.add_argument("--temporal-dropout", type=float, default=0.2,
+                        help="Dropout applied around temporal feature aggregation")
+    parser.add_argument("--decoder-dropout", type=float, default=0.2,
+                        help="Dropout applied inside decoder blocks")
+    parser.add_argument("--early-stopping-patience", type=int, default=2,
+                        help="Stop if val mortality IoU fails to improve for this many epochs")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4,
+                        help="Minimum val mortality IoU gain to reset early stopping")
+    parser.add_argument("--augment-change-threshold", type=float, default=None,
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if any(
+        lr is not None
+        for lr in (args.encoder_lr, args.temporal_lr, args.decoder_lr)
+    ):
+        print(
+            "WARNING: --encoder-lr, --temporal-lr, and --decoder-lr are "
+            "deprecated and ignored. Using --lr for all trainable parameters."
+        )
+    if args.augment_change_threshold is not None:
+        print(
+            "WARNING: --augment-change-threshold is deprecated and ignored. "
+            "Heavy augmentation now applies to every training patch."
+        )
+    if args.loss == "focal_dice" and args.label_smoothing != 0.05:
+        print(
+            "WARNING: --label-smoothing is ignored when using --loss focal_dice."
+        )
+
+    set_seed(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Seed: {args.seed}")
 
     # Load manifest
     df = pd.read_csv(args.manifest)
@@ -149,25 +216,38 @@ def main():
     print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
     # Datasets
-    train_dataset = S1ChangeDataset(train_df, augment=True)
+    train_dataset = S1ChangeDataset(
+        train_df,
+        augment=True,
+    )
     val_dataset = S1ChangeDataset(val_df, augment=False)
 
     # Balanced sampler for training
-    sampler = make_balanced_sampler(train_df)
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(args.seed)
+    sampler = make_balanced_sampler(train_df, generator=sampler_generator)
+    train_loader_generator = torch.Generator()
+    train_loader_generator.manual_seed(args.seed)
+    val_loader_generator = torch.Generator()
+    val_loader_generator.manual_seed(args.seed + 1)
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, sampler=sampler,
-        num_workers=4, pin_memory=True,
+        num_workers=4, pin_memory=True, worker_init_fn=seed_worker,
+        generator=train_loader_generator,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=4, pin_memory=True,
+        num_workers=4, pin_memory=True, worker_init_fn=seed_worker,
+        generator=val_loader_generator,
     )
 
     # Model
     model = S1ChangeDetector(
         checkpoint_path=args.checkpoint,
         num_classes=2,
-        temporal_encoding_dim=64,
+        temporal_encoding_dim=args.temporal_encoding_dim,
+        temporal_dropout=args.temporal_dropout,
+        decoder_dropout=args.decoder_dropout,
     ).to(device)
 
     # Count parameters
@@ -176,40 +256,42 @@ def main():
     print(f"Parameters: {total_params:,} total, {trainable_params:,} trainable")
 
     # Loss
-    criterion = CombinedCrossEntropyDiceLoss(
-        num_classes=2,
-        alpha=args.alpha,
-        label_smoothing=args.label_smoothing,
-        ce_weight=args.ce_weight,
-        dice_weight=args.dice_weight,
-        ignore_index=255,
-    )
+    if args.loss == "focal_dice":
+        criterion = CombinedFocalDiceLoss(
+            num_classes=2,
+            alpha=args.alpha,
+            gamma=args.focal_gamma,
+            focal_weight=args.focal_weight,
+            dice_weight=args.dice_weight,
+            ignore_index=255,
+        )
+    else:
+        criterion = CombinedCrossEntropyDiceLoss(
+            num_classes=2,
+            alpha=args.alpha,
+            label_smoothing=args.label_smoothing,
+            ce_weight=args.ce_weight,
+            dice_weight=args.dice_weight,
+            ignore_index=255,
+        )
+    print(f"Loss: {args.loss}")
 
-    # Optimizer with discriminative learning rates
-    encoder_spatial_params = []
+    # Keep a handle on the lower spatial encoder layers for the freeze schedule.
     encoder_spatial_low_params = []
-    temporal_params = []
-    decoder_params = []
 
     for name, param in model.named_parameters():
-        if "encoder.spatial.stem" in name or "encoder.spatial.layer1" in name or "encoder.spatial.layer2" in name:
+        if (
+            "encoder.spatial.stem" in name
+            or "encoder.spatial.layer1" in name
+            or "encoder.spatial.layer2" in name
+        ):
             encoder_spatial_low_params.append(param)
-        elif "encoder.spatial" in name:
-            encoder_spatial_params.append(param)
-        elif "encoder.lstms" in name:
-            temporal_params.append(param)
-        elif "temporal_encoding" in name:
-            temporal_params.append(param)
-        else:
-            decoder_params.append(param)
 
-    encoder_spatial_mid_lr = (args.encoder_lr + args.temporal_lr) / 2
-    optimizer = optim.AdamW([
-        {"params": encoder_spatial_low_params, "lr": args.encoder_lr},
-        {"params": encoder_spatial_params, "lr": encoder_spatial_mid_lr},
-        {"params": temporal_params, "lr": args.temporal_lr},
-        {"params": decoder_params, "lr": args.decoder_lr},
-    ], weight_decay=1e-2)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=1e-2,
+    )
 
     # Decay from the configured starting rates instead of ramping upward.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -235,6 +317,8 @@ def main():
     metrics_writer.writerow(metric_keys)
 
     best_iou = 0.0
+    best_epoch = 0
+    epochs_without_improvement = 0
 
     for epoch in range(1, args.epochs + 1):
         # Encoder freezing schedule
@@ -250,7 +334,7 @@ def main():
         print(f"{'='*60}")
 
         # Train
-        current_lr = optimizer.param_groups[-1]["lr"]
+        current_lr = optimizer.param_groups[0]["lr"]
         t0 = time.time()
         train_result = train_one_epoch(
             model, train_loader, optimizer, criterion, device, scaler, epoch,
@@ -294,16 +378,33 @@ def main():
             metrics_writer.writerow(row)
 
         # Save best model by mortality IoU
-        if val_result["iou_class_1"] > best_iou:
+        if val_result["iou_class_1"] > best_iou + args.early_stopping_min_delta:
             best_iou = val_result["iou_class_1"]
+            best_epoch = epoch
+            epochs_without_improvement = 0
             torch.save(model.state_dict(), save_dir / "best_model.pt")
             print(f"  New best mortality IoU: {best_iou:.4f}")
+        else:
+            epochs_without_improvement += 1
 
         # Save periodic checkpoint
         if epoch % 5 == 0:
             torch.save(model.state_dict(), save_dir / f"model_epoch{epoch}.pt")
 
-    print(f"\nTraining complete. Best mortality IoU: {best_iou:.4f}")
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            print(
+                f"Early stopping at epoch {epoch}: no val mortality IoU "
+                f"improvement for {epochs_without_improvement} epoch(s)."
+            )
+            break
+
+    print(
+        f"\nTraining complete. Best mortality IoU: {best_iou:.4f}"
+        f" (epoch {best_epoch})"
+    )
     print(f"Results saved to {save_dir}")
 
 

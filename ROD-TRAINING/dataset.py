@@ -27,6 +27,7 @@ class S1ChangeDataset(Dataset):
         manifest_df: DataFrame with columns chip_path, mask_path, acquisition_dates, split.
         augment: Whether to apply data augmentation.
         sentinel1_repeat_days: Sentinel-1 repeat cycle (default 12 days) for DoY fallback.
+        input_channels: 2 keeps VV/VH; 3 keeps VV/VH/RVI for legacy checkpoints.
     """
 
     def __init__(
@@ -34,10 +35,15 @@ class S1ChangeDataset(Dataset):
         manifest_df,
         augment: bool = False,
         sentinel1_repeat_days: int = 12,
+        input_channels: int = 2,
     ):
+        if input_channels not in (2, 3):
+            raise ValueError("input_channels must be 2 (VV/VH) or 3 (VV/VH/RVI).")
+
         self.df = manifest_df.reset_index(drop=True)
         self.augment = augment
         self.repeat_days = sentinel1_repeat_days
+        self.input_channels = input_channels
 
     def __len__(self) -> int:
         return len(self.df)
@@ -51,8 +57,8 @@ class S1ChangeDataset(Dataset):
         # Reverse temporal order: index 0=oldest, index 5=newest
         chip = chip[::-1].copy()
 
-        # Drop RVI channel — keep only VV_dB and VH_dB
-        chip = chip[:, :2]  # (6, 2, 256, 256)
+        # Keep VV/VH by default; legacy RVI checkpoints use all three channels.
+        chip = chip[:, :self.input_channels]
 
         # --- NaN handling ---
         # Build NaN mask across all timesteps and channels before filling
@@ -119,9 +125,9 @@ class S1ChangeDataset(Dataset):
         mask: np.ndarray,
         valid: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Apply augmentation pipeline to chip, mask, and valid."""
-        T, C, H, W = chip.shape
-
+        """
+        Apply full augmentation to every training patch.
+        """
         # --- 1. Random crop + resize ---
         chip, mask, valid = self._random_crop(chip, mask, valid, scale_range=(0.8, 1.0))
 

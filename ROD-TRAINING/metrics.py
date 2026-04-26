@@ -44,12 +44,31 @@ class ChangeDetectionMetrics:
             if valid_count == 0:
                 return
 
-            preds_flat = preds[valid].cpu().numpy()
-            targets_flat = targets[valid].cpu().numpy()
+            preds_flat = preds[valid].to(torch.int64)
+            targets_flat = targets[valid].to(torch.int64)
+            in_range = (
+                (targets_flat >= 0)
+                & (targets_flat < self.num_classes)
+                & (preds_flat >= 0)
+                & (preds_flat < self.num_classes)
+            )
 
-            for p, t in zip(preds_flat, targets_flat):
-                if 0 <= t < self.num_classes and 0 <= p < self.num_classes:
-                    self.confusion[t][p] += 1
+            if bool(in_range.any()):
+                encoded = (
+                    targets_flat[in_range] * self.num_classes
+                    + preds_flat[in_range]
+                )
+                counts = torch.bincount(
+                    encoded,
+                    minlength=self.num_classes * self.num_classes,
+                ).reshape(self.num_classes, self.num_classes)
+
+                counts_list = counts.cpu().tolist()
+                for target_class in range(self.num_classes):
+                    for pred_class in range(self.num_classes):
+                        self.confusion[target_class][pred_class] += int(
+                            counts_list[target_class][pred_class],
+                        )
 
             self.total_valid += valid_count
 
