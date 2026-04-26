@@ -178,7 +178,7 @@ class S1ChangeDetector:
 
 #### Sentinel-1 SAR
 
-- **Orbits:** Three relative orbits (22, 95, 124)
+- **Orbits:** One relative orbits (124)
 - **Mode:** Ascending
 - **Repeat Cycle:** 12 days
 - **Channels:**
