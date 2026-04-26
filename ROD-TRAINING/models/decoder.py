@@ -12,16 +12,19 @@ import torch.nn as nn
 class ConvBlock(nn.Module):
     """Double convolution block: Conv3x3 + BN + ReLU x2."""
 
-    def __init__(self, ch_in: int, ch_out: int):
+    def __init__(self, ch_in: int, ch_out: int, dropout: float = 0.0):
         super().__init__()
-        self.conv = nn.Sequential(
+        layers = [
             nn.Conv2d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
             nn.BatchNorm2d(ch_out),
             nn.ReLU(inplace=True),
             nn.Conv2d(ch_out, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
             nn.BatchNorm2d(ch_out),
             nn.ReLU(inplace=True),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(dropout))
+        self.conv = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
@@ -48,6 +51,7 @@ class UNetDecoder(nn.Module):
         self,
         encoder_channels: list[int] | None = None,
         num_classes: int = 2,
+        dropout: float = 0.0,
     ):
         super().__init__()
         if encoder_channels is None:
@@ -58,21 +62,21 @@ class UNetDecoder(nn.Module):
         # Decoder blocks: upsample → cat(skip) → conv
         # f4 at H/32 → d3 at H/16 → d2 at H/8 → d1 at H/4 → d0 at H/2 → final at H
         self.up3 = nn.ConvTranspose2d(c4, c3, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(c3 + c3, c3)
+        self.dec3 = ConvBlock(c3 + c3, c3, dropout=dropout)
 
         self.up2 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(c2 + c2, c2)
+        self.dec2 = ConvBlock(c2 + c2, c2, dropout=dropout)
 
         self.up1 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(c1 + c1, c1)
+        self.dec1 = ConvBlock(c1 + c1, c1, dropout=dropout)
 
         # H/4 → H/2
         self.up0 = nn.ConvTranspose2d(c1, 64, kernel_size=2, stride=2)
-        self.dec0 = ConvBlock(64, 64)
+        self.dec0 = ConvBlock(64, 64, dropout=dropout)
 
         # H/2 → H (final upsample to original resolution)
         self.up_final = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
-        self.dec_final = ConvBlock(32, 32)
+        self.dec_final = ConvBlock(32, 32, dropout=dropout)
 
         self.head = nn.Conv2d(32, num_classes, kernel_size=1)
 

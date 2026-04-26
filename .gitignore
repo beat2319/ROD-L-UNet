@@ -99,7 +99,7 @@ Thumbs.db
 logs/
 
 *.Rhistory
-*.png
 *.csv
 *.pdf
 .syncthing.*.tmp
+*.json

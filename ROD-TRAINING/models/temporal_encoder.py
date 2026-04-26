@@ -105,7 +105,7 @@ class SpatioTemporalEncoder(nn.Module):
     """
     ResNet-50 per date → ConvLSTM across dates at each spatial scale.
 
-    Input:  (B, T, C, H, W) = (B, 6, 2, 256, 256)
+    Input:  (B, T, C, H, W) = (B, 6, input_channels, 256, 256)
     Output: List of 4 temporally-aggregated feature maps.
 
     If temporal_encoding_dim > 0, expects a doy tensor to produce
@@ -116,14 +116,25 @@ class SpatioTemporalEncoder(nn.Module):
     def __init__(
         self,
         checkpoint_path: str | None = None,
+        input_channels: int = 2,
         temporal_encoding_dim: int = 0,
+        temporal_dropout: float = 0.0,
     ):
         super().__init__()
-        self.spatial = ResNet50Encoder(checkpoint_path)
+        self.spatial = ResNet50Encoder(
+            checkpoint_path=checkpoint_path,
+            input_channels=input_channels,
+        )
 
         # ResNet output channels at each scale
         spatial_channels = [256, 512, 1024, 2048]
         self.temporal_encoding_dim = temporal_encoding_dim
+        self.temporal_input_dropout = (
+            nn.Dropout2d(temporal_dropout) if temporal_dropout > 0 else nn.Identity()
+        )
+        self.temporal_output_dropout = (
+            nn.Dropout2d(temporal_dropout) if temporal_dropout > 0 else nn.Identity()
+        )
 
         # ConvLSTM at each spatial scale
         self.lstms = nn.ModuleList()
@@ -173,8 +184,12 @@ class SpatioTemporalEncoder(nn.Module):
                 t_emb = t_emb.expand(-1, -1, -1, H_i, W_i)
                 feat_t = torch.cat([feat_t, t_emb], dim=2)  # (T, B, C_i + enc_dim, H_i, W_i)
 
+            feat_t = feat_t.reshape(T * B, feat_t.shape[2], H_i, W_i)
+            feat_t = self.temporal_input_dropout(feat_t)
+            feat_t = feat_t.reshape(T, B, -1, H_i, W_i)
+
             h_final, _ = lstm(feat_t)  # (B, C_i, H_i, W_i)
-            temporal_feats.append(h_final)
+            temporal_feats.append(self.temporal_output_dropout(h_final))
 
         return temporal_feats
 

@@ -1,0 +1,891 @@
+---
+title: "Flightline Pixels Universal Kriging"
+output:
+  html_document:
+    code_folding: hide
+params:
+  point_path: "GAO_point_data/gao_2016_clipped_01122016.geojson"
+  boundary_path: "DMSM_vector_data/flightlines_hawaii_2016_processed.geojson"
+  boundary_filter_field: "START_DATE_STR"
+  boundary_filter_value: "01/12/2016"
+  response_field: "Pixels"
+  grid_resolution_m: 2
+  seed: 52
+---
+
+This notebook fits a universal kriging model for one clipped flightline point
+layer and writes a grid-based prediction surface at 2 m resolution. The
+workflow validates the supplied inputs, checks coordinate trend, fits the
+semivariogram first, and then performs universal kriging over the masked grid.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(sf)
+  library(sp)
+  library(terra)
+  library(gstat)
+  library(ggplot2)
+  library(knitr)
+})
+
+set.seed(params$seed)
+
+point_path <- params$point_path
+boundary_path <- params$boundary_path
+boundary_filter_field <- params$boundary_filter_field
+boundary_filter_value <- params$boundary_filter_value
+response_field <- params$response_field
+grid_resolution_m <- as.numeric(params$grid_resolution_m)
+seed_value <- as.integer(params$seed)
+
+variogram_sample_limit <- 5000L
+candidate_models <- c("Sph", "Exp", "Gau", "Mat")
+anisotropy_directions <- c(0, 45, 90, 135)
+kriging_batch_size <- 50000L
+stream_block_target_cells <- 1000000L
+kriging_nmax <- 60L
+minimum_point_count <- 10L
+gdal_write_options <- c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES")
+```
+
+```{r helpers}
+fail_if_missing <- function(path_value, label) {
+  if (!nzchar(path_value)) {
+    stop(label, " must be provided via notebook parameters.", call. = FALSE)
+  }
+  if (!file.exists(path_value)) {
+    stop("Missing ", label, ": ", path_value, call. = FALSE)
+  }
+}
+
+read_valid_sf <- function(path) {
+  x <- sf::st_read(path, quiet = TRUE)
+  x <- sf::st_zm(x, drop = TRUE, what = "ZM")
+  sf::st_make_valid(x)
+}
+
+geometry_type_set <- function(x) {
+  sort(unique(as.character(sf::st_geometry_type(x, by_geometry = TRUE))))
+}
+
+require_projected_crs <- function(x, label) {
+  if (is.na(sf::st_crs(x))) {
+    stop(label, " must have a CRS.", call. = FALSE)
+  }
+  if (sf::st_is_longlat(x)) {
+    stop(label, " must use a projected CRS in meters.", call. = FALSE)
+  }
+}
+
+numeric_or_fail <- function(x, label) {
+  y <- suppressWarnings(as.numeric(x))
+  if (anyNA(y)) {
+    stop(label, " must be numeric and cannot contain missing values.", call. = FALSE)
+  }
+  y
+}
+
+normalize_date_token <- function(x) {
+  gsub("[^0-9]", "", as.character(x))
+}
+
+filter_boundary_features <- function(boundary_sf, filter_field, filter_value) {
+  if (!nzchar(filter_field) || !nzchar(filter_value)) {
+    return(boundary_sf)
+  }
+
+  if (!filter_field %in% names(boundary_sf)) {
+    stop(
+      "The boundary layer does not contain the filter field: ",
+      filter_field,
+      call. = FALSE
+    )
+  }
+
+  boundary_values <- as.character(boundary_sf[[filter_field]])
+  direct_match <- !is.na(boundary_values) & boundary_values == filter_value
+
+  if (!any(direct_match)) {
+    normalized_match <- !is.na(boundary_values) &
+      normalize_date_token(boundary_values) == normalize_date_token(filter_value)
+    direct_match <- normalized_match
+  }
+
+  boundary_subset <- boundary_sf[direct_match, ]
+
+  if (nrow(boundary_subset) == 0) {
+    stop(
+      "No boundary features matched ",
+      filter_field,
+      " = ",
+      filter_value,
+      ".",
+      call. = FALSE
+    )
+  }
+
+  boundary_subset
+}
+
+extract_lm_summary <- function(model, model_label) {
+  model_summary <- summary(model)
+  data.frame(
+    model = model_label,
+    r_squared = unname(model_summary$r.squared),
+    adj_r_squared = unname(model_summary$adj.r.squared),
+    residual_se = unname(model_summary$sigma),
+    stringsAsFactors = FALSE
+  )
+}
+
+extract_lm_coefficients <- function(model, model_label) {
+  coef_df <- as.data.frame(summary(model)$coefficients)
+  coef_df$term <- rownames(coef_df)
+  rownames(coef_df) <- NULL
+  names(coef_df) <- c("estimate", "std_error", "t_value", "p_value", "term")
+  coef_df$model <- model_label
+  coef_df[, c("model", "term", "estimate", "std_error", "t_value", "p_value")]
+}
+
+max_pair_distance_from_sample <- function(xy) {
+  if (nrow(xy) < 2) {
+    stop("At least two sampled points are required to compute lag distances.", call. = FALSE)
+  }
+
+  hull_idx <- unique(chull(xy[, "X"], xy[, "Y"]))
+  hull_xy <- xy[hull_idx, , drop = FALSE]
+
+  if (nrow(hull_xy) < 2) {
+    return(0)
+  }
+
+  as.numeric(max(dist(hull_xy)))
+}
+
+fit_one_variogram_model <- function(model_name, empirical_vgm, initial_psill, initial_range, initial_nugget) {
+  initial_model <- if (identical(model_name, "Mat")) {
+    vgm(
+      psill = initial_psill,
+      model = model_name,
+      range = initial_range,
+      nugget = initial_nugget,
+      kappa = 0.5
+    )
+  } else {
+    vgm(
+      psill = initial_psill,
+      model = model_name,
+      range = initial_range,
+      nugget = initial_nugget
+    )
+  }
+
+  fit <- try(
+    suppressWarnings(fit.variogram(empirical_vgm, initial_model)),
+    silent = TRUE
+  )
+
+  if (inherits(fit, "try-error")) {
+    return(NULL)
+  }
+
+  if (any(is.na(fit$psill)) || any(is.na(fit$range)) || any(fit$psill < 0) || any(fit$range < 0)) {
+    return(NULL)
+  }
+
+  fit
+}
+
+save_base_preview <- function(pred_raster, var_raster, boundary_vect, output_path, main_prefix) {
+  png(filename = output_path, width = 1800, height = 900, res = 170)
+  old_par <- par(no.readonly = TRUE)
+  on.exit({
+    par(old_par)
+    dev.off()
+  }, add = TRUE)
+
+  par(mfrow = c(1, 2), mar = c(4, 4, 4, 5))
+
+  terra::plot(pred_raster, main = paste(main_prefix, "Prediction"))
+  plot(boundary_vect, add = TRUE, border = "#202020", col = NA, lwd = 0.4)
+
+  terra::plot(var_raster, main = paste(main_prefix, "Prediction Variance"))
+  plot(boundary_vect, add = TRUE, border = "#202020", col = NA, lwd = 0.4)
+}
+
+meter_labels <- function(x) {
+  paste0(format(round(x), big.mark = ","), " m")
+}
+```
+
+## Parameters
+
+```{r parameter-summary}
+parameter_summary <- data.frame(
+  parameter = c(
+    "point_path",
+    "boundary_path",
+    "boundary_filter_field",
+    "boundary_filter_value",
+    "response_field",
+    "grid_resolution_m",
+    "seed"
+  ),
+  value = c(
+    point_path,
+    boundary_path,
+    boundary_filter_field,
+    boundary_filter_value,
+    response_field,
+    grid_resolution_m,
+    seed_value
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(parameter_summary)
+```
+
+## Load And Validate Inputs
+
+```{r load-inputs}
+fail_if_missing(point_path, "point_path")
+fail_if_missing(boundary_path, "boundary_path")
+
+point_stem <- tools::file_path_sans_ext(basename(point_path))
+response_slug <- tolower(gsub("[^A-Za-z0-9]+", "_", response_field))
+grid_resolution_label <- gsub("\\.0+$", "", format(grid_resolution_m, trim = TRUE, scientific = FALSE))
+output_dir <- file.path("outputs", paste0("flightline_uk_", point_stem))
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+points_sf <- read_valid_sf(point_path)
+boundary_sf <- read_valid_sf(boundary_path)
+
+point_geom_types <- geometry_type_set(points_sf)
+boundary_geom_types <- geometry_type_set(boundary_sf)
+
+if (!identical(point_geom_types, "POINT")) {
+  stop(
+    "The point layer must contain only POINT geometries; found: ",
+    paste(point_geom_types, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+if (!all(boundary_geom_types %in% c("POLYGON", "MULTIPOLYGON"))) {
+  stop(
+    "The boundary layer must contain only POLYGON or MULTIPOLYGON geometries; found: ",
+    paste(boundary_geom_types, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+require_projected_crs(points_sf, "The point layer")
+require_projected_crs(boundary_sf, "The boundary layer")
+
+if (sf::st_crs(boundary_sf) != sf::st_crs(points_sf)) {
+  boundary_sf <- sf::st_transform(boundary_sf, sf::st_crs(points_sf))
+}
+
+boundary_sf <- filter_boundary_features(
+  boundary_sf = boundary_sf,
+  filter_field = boundary_filter_field,
+  filter_value = boundary_filter_value
+)
+
+if (!response_field %in% names(points_sf)) {
+  stop("The point layer must contain the response field: ", response_field, call. = FALSE)
+}
+
+if (!is.finite(grid_resolution_m) || grid_resolution_m <= 0) {
+  stop("grid_resolution_m must be a positive numeric value.", call. = FALSE)
+}
+
+points_sf[[response_field]] <- numeric_or_fail(points_sf[[response_field]], response_field)
+point_xy <- sf::st_coordinates(sf::st_geometry(points_sf))
+points_sf$X <- point_xy[, "X"]
+points_sf$Y <- point_xy[, "Y"]
+
+points_sf <- points_sf[
+  !sf::st_is_empty(points_sf) &
+    is.finite(points_sf$X) &
+    is.finite(points_sf$Y),
+]
+
+if (nrow(points_sf) < minimum_point_count) {
+  stop(
+    "The point layer must contain at least ",
+    minimum_point_count,
+    " valid points after cleaning; found ",
+    nrow(points_sf),
+    ".",
+    call. = FALSE
+  )
+}
+
+boundary_union <- sf::st_union(sf::st_geometry(boundary_sf))
+boundary_union_sf <- sf::st_sf(geometry = boundary_union)
+
+points_within_boundary <- lengths(sf::st_covered_by(points_sf, boundary_union_sf)) > 0
+
+if (!all(points_within_boundary)) {
+  stop(
+    sum(!points_within_boundary),
+    " supplied points are not covered by the provided boundary after CRS harmonization.",
+    call. = FALSE
+  )
+}
+
+analysis_summary <- data.frame(
+  metric = c(
+    "Point count",
+    "Boundary feature count (selected)",
+    "Boundary filter",
+    "Response field",
+    "Grid resolution",
+    "CRS",
+    "Boundary area (m^2)",
+    "Output directory"
+  ),
+  value = c(
+    format(nrow(points_sf), big.mark = ","),
+    format(nrow(boundary_sf), big.mark = ","),
+    if (nzchar(boundary_filter_field) && nzchar(boundary_filter_value)) {
+      paste0(boundary_filter_field, " = ", boundary_filter_value)
+    } else {
+      "None"
+    },
+    response_field,
+    paste0(grid_resolution_label, " m"),
+    sf::st_crs(points_sf)$input,
+    format(round(sum(as.numeric(sf::st_area(boundary_union_sf))), 2), big.mark = ","),
+    output_dir
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(analysis_summary)
+```
+
+## Coordinate Trend Diagnostics
+
+```{r trend-diagnostics}
+trend_formula_first <- stats::as.formula(paste(response_field, "~ X + Y"))
+trend_formula_second <- stats::as.formula(paste(response_field, "~ X + Y + I(X^2) + I(Y^2) + I(X * Y)"))
+
+trend_first <- lm(trend_formula_first, data = sf::st_drop_geometry(points_sf))
+trend_second <- lm(trend_formula_second, data = sf::st_drop_geometry(points_sf))
+
+trend_model_summary <- rbind(
+  extract_lm_summary(trend_first, "First-order"),
+  extract_lm_summary(trend_second, "Second-order")
+)
+
+trend_coefficient_summary <- rbind(
+  extract_lm_coefficients(trend_first, "First-order"),
+  extract_lm_coefficients(trend_second, "Second-order")
+)
+
+kable(trend_model_summary, digits = 4)
+kable(trend_coefficient_summary, digits = 4)
+```
+
+## Fit The Residual Semivariogram
+
+```{r empirical-semivariogram}
+variogram_sample_n <- min(variogram_sample_limit, nrow(points_sf))
+variogram_sample_idx <- sample.int(nrow(points_sf), variogram_sample_n)
+variogram_sample <- points_sf[variogram_sample_idx, ]
+
+sample_xy <- sf::st_coordinates(sf::st_geometry(variogram_sample))
+colnames(sample_xy) <- c("X", "Y")
+max_sampled_pair_distance_m <- max_pair_distance_from_sample(sample_xy)
+cutoff_m <- 0.4 * max_sampled_pair_distance_m
+width_m <- cutoff_m / 20
+
+if (!is.finite(cutoff_m) || cutoff_m <= 0 || !is.finite(width_m) || width_m <= 0) {
+  stop("Derived semivariogram lag settings are not valid.", call. = FALSE)
+}
+
+variogram_formula <- stats::as.formula(paste(response_field, "~ X + Y"))
+empirical_vgm <- variogram(
+  variogram_formula,
+  data = variogram_sample,
+  cutoff = cutoff_m,
+  width = width_m
+)
+
+if (nrow(empirical_vgm) == 0) {
+  stop("The empirical semivariogram produced no lag bins.", call. = FALSE)
+}
+
+semivariogram_settings <- data.frame(
+  metric = c("Variogram sample size", "Max sampled pair distance", "Cutoff", "Lag width"),
+  value = c(
+    format(variogram_sample_n, big.mark = ","),
+    paste0(format(round(max_sampled_pair_distance_m, 2), big.mark = ","), " m"),
+    paste0(format(round(cutoff_m, 2), big.mark = ","), " m"),
+    paste0(format(round(width_m, 2), big.mark = ","), " m")
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(semivariogram_settings)
+head(empirical_vgm)
+```
+
+```{r fit-semivariogram}
+gamma_max <- max(empirical_vgm$gamma, na.rm = TRUE)
+gamma_min <- min(empirical_vgm$gamma, na.rm = TRUE)
+
+initial_nugget <- max(0, gamma_min * 0.5)
+initial_psill <- max(.Machine$double.eps, gamma_max - initial_nugget)
+initial_range <- cutoff_m / 3
+
+fitted_models <- Filter(
+  Negate(is.null),
+  lapply(
+    candidate_models,
+    fit_one_variogram_model,
+    empirical_vgm = empirical_vgm,
+    initial_psill = initial_psill,
+    initial_range = initial_range,
+    initial_nugget = initial_nugget
+  )
+)
+
+if (length(fitted_models) == 0) {
+  stop("No valid semivariogram model could be fitted.", call. = FALSE)
+}
+
+fitted_sse <- sapply(fitted_models, function(fit) attr(fit, "SSErr"))
+fit_labels <- sapply(fitted_models, function(fit) as.character(fit$model[2]))
+names(fitted_sse) <- fit_labels
+
+fit_summary <- data.frame(
+  model = fit_labels,
+  sse = as.numeric(fitted_sse),
+  fitted_range_m = as.numeric(sapply(fitted_models, function(fit) fit$range[2])),
+  partial_sill = as.numeric(sapply(fitted_models, function(fit) fit$psill[2])),
+  nugget = as.numeric(sapply(fitted_models, function(fit) fit$psill[1])),
+  stringsAsFactors = FALSE
+)
+fit_summary <- fit_summary[order(fit_summary$sse), ]
+
+selected_model <- fitted_models[[which.min(fitted_sse)]]
+selected_model_name <- as.character(selected_model$model[2])
+fitted_range_m <- as.numeric(selected_model$range[2])
+
+if (!is.finite(fitted_range_m) || fitted_range_m <= 0) {
+  stop("The selected semivariogram model has an invalid fitted range.", call. = FALSE)
+}
+
+selected_model_summary <- data.frame(
+  selected_model = selected_model_name,
+  fitted_range_m = round(fitted_range_m, 2),
+  maxdist_for_kriging_m = round(fitted_range_m, 2),
+  nmax = kriging_nmax,
+  stringsAsFactors = FALSE
+)
+
+kable(fit_summary, digits = 4)
+kable(selected_model_summary, digits = 2)
+selected_model
+```
+
+```{r plot-fitted-semivariogram, fig.width=9, fig.height=6}
+fitted_line <- variogramLine(
+  selected_model,
+  maxdist = cutoff_m,
+  dist_vector = seq(0, cutoff_m, by = width_m)
+)
+
+range_label <- if (fitted_range_m <= cutoff_m) {
+  paste0("Fitted range = ", format(round(fitted_range_m), big.mark = ","), " m")
+} else {
+  paste0("Fitted range > ", format(round(cutoff_m), big.mark = ","), " m")
+}
+
+range_vline_x <- min(fitted_range_m, cutoff_m)
+range_label_x <- if (fitted_range_m <= cutoff_m) {
+  min(max(fitted_range_m + cutoff_m * 0.04, cutoff_m * 0.1), cutoff_m * 0.85)
+} else {
+  cutoff_m * 0.08
+}
+
+fit_plot <- ggplot(empirical_vgm, aes(x = dist, y = gamma)) +
+  geom_point(
+    aes(size = np),
+    shape = 21,
+    stroke = 0.8,
+    color = "#5a1712",
+    fill = "#912d25",
+    alpha = 0.9
+  ) +
+  geom_line(
+    data = fitted_line,
+    aes(x = dist, y = gamma),
+    inherit.aes = FALSE,
+    color = "#1f5e5a",
+    linewidth = 1.1
+  ) +
+  geom_vline(
+    xintercept = range_vline_x,
+    color = "#1f5e5a",
+    linewidth = 0.9,
+    linetype = "dashed"
+  ) +
+  annotate(
+    "label",
+    x = range_label_x,
+    y = max(empirical_vgm$gamma, na.rm = TRUE),
+    label = range_label,
+    hjust = 0,
+    vjust = 1,
+    size = 3.8,
+    color = "#173f3c",
+    fill = "white",
+    label.size = 0.25
+  ) +
+  scale_x_continuous(labels = meter_labels) +
+  scale_size_continuous(name = "Pair count", range = c(1.8, 5.2)) +
+  coord_cartesian(xlim = c(0, cutoff_m)) +
+  labs(
+    title = "Residual Semivariogram With Fitted Model",
+    subtitle = paste0(
+      point_stem,
+      " | drift: ",
+      response_field,
+      " ~ X + Y | best fit: ",
+      selected_model_name
+    ),
+    x = "Lag Distance (m)",
+    y = paste0("Semivariance of ", response_field)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "#d8e7e5", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#173f3c"),
+    axis.text = element_text(color = "#173f3c"),
+    legend.title = element_text(color = "#173f3c"),
+    legend.text = element_text(color = "#173f3c"),
+    plot.title = element_text(color = "#173f3c", face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "#315f5b", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+fit_plot_path <- file.path(output_dir, paste0(response_slug, "_semivariogram_fit.png"))
+ggsave(
+  filename = fit_plot_path,
+  plot = fit_plot,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+fit_plot
+```
+
+## Directional Diagnostic
+
+```{r plot-directional-semivariogram, fig.width=9, fig.height=6}
+directional_vgm <- variogram(
+  variogram_formula,
+  data = variogram_sample,
+  cutoff = cutoff_m,
+  width = width_m,
+  alpha = anisotropy_directions
+)
+
+directional_vgm$direction <- factor(
+  paste0(directional_vgm$dir.hor, " degrees"),
+  levels = paste0(anisotropy_directions, " degrees")
+)
+
+directional_plot <- ggplot(directional_vgm, aes(x = dist, y = gamma, color = direction)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    shape = 21,
+    size = 2.6,
+    stroke = 0.7,
+    fill = "white"
+  ) +
+  scale_color_manual(
+    values = c(
+      "0 degrees" = "#912d25",
+      "45 degrees" = "#6f201b",
+      "90 degrees" = "#b8584f",
+      "135 degrees" = "#3f100d"
+    ),
+    name = "Direction"
+  ) +
+  scale_x_continuous(labels = meter_labels) +
+  labs(
+    title = "Directional Residual Semivariograms",
+    subtitle = "Directional structure is shown for diagnosis only; the final kriging model remains isotropic.",
+    x = "Lag Distance (m)",
+    y = paste0("Semivariance of ", response_field)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "#ead8d6", linewidth = 0.35),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(color = "#4d1713"),
+    axis.text = element_text(color = "#4d1713"),
+    legend.title = element_text(color = "#4d1713"),
+    legend.text = element_text(color = "#4d1713"),
+    plot.title = element_text(color = "#4d1713", face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(color = "#6f201b", hjust = 0.5),
+    plot.margin = margin(12, 12, 12, 12)
+  )
+
+directional_plot_path <- file.path(output_dir, paste0(response_slug, "_semivariogram_directional.png"))
+ggsave(
+  filename = directional_plot_path,
+  plot = directional_plot,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+directional_plot
+```
+
+## Build The 2 m Prediction Grid
+
+```{r build-grid}
+boundary_area_m2 <- sum(as.numeric(sf::st_area(boundary_union_sf)))
+estimated_prediction_cells <- as.numeric(boundary_area_m2 / (grid_resolution_m ^ 2))
+
+boundary_vect <- terra::vect(boundary_union_sf)
+grid_template <- terra::rast(
+  terra::ext(boundary_vect),
+  resolution = grid_resolution_m,
+  crs = sf::st_crs(points_sf)$wkt
+)
+
+mask_output_path <- file.path(output_dir, paste0("prediction_mask_", grid_resolution_label, "m.tif"))
+grid_mask <- terra::rasterize(
+  boundary_vect,
+  grid_template,
+  field = 1,
+  background = NA,
+  filename = mask_output_path,
+  overwrite = TRUE,
+  wopt = list(gdal = gdal_write_options)
+)
+
+row_block_nrows <- max(
+  1L,
+  as.integer(floor(stream_block_target_cells / max(1, terra::ncol(grid_mask))))
+)
+row_block_starts <- seq.int(1L, terra::nrow(grid_mask), by = row_block_nrows)
+
+grid_summary <- data.frame(
+  metric = c(
+    "Estimated boundary cells",
+    "Raster columns",
+    "Raster rows",
+    "Grid resolution",
+    "Kriging batch size",
+    "Row block size"
+  ),
+  value = c(
+    format(round(estimated_prediction_cells), big.mark = ","),
+    format(terra::ncol(grid_mask), big.mark = ","),
+    format(terra::nrow(grid_mask), big.mark = ","),
+    paste0(grid_resolution_label, " m"),
+    format(kriging_batch_size, big.mark = ","),
+    paste0(format(row_block_nrows, big.mark = ","), " rows")
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(grid_summary)
+```
+
+## Universal Kriging On Grid Centroids
+
+```{r run-kriging}
+points_sp <- as(points_sf[, c(response_field, "X", "Y")], "Spatial")
+kriging_formula <- stats::as.formula(paste(response_field, "~ X + Y"))
+
+pred_output_path <- file.path(output_dir, paste0(response_slug, "_uk_pred_", grid_resolution_label, "m.tif"))
+var_output_path <- file.path(output_dir, paste0(response_slug, "_uk_var_", grid_resolution_label, "m.tif"))
+
+pred_raster <- terra::rast(grid_mask)
+var_raster <- terra::rast(grid_mask)
+
+terra::writeStart(
+  pred_raster,
+  filename = pred_output_path,
+  overwrite = TRUE,
+  gdal = gdal_write_options
+)
+terra::writeStart(
+  var_raster,
+  filename = var_output_path,
+  overwrite = TRUE,
+  gdal = gdal_write_options
+)
+
+terra::readStart(grid_mask)
+
+finite_prediction_cells <- 0L
+finite_variance_cells <- 0L
+prediction_min <- Inf
+prediction_max <- -Inf
+variance_min <- Inf
+variance_max <- -Inf
+
+for (row_start in row_block_starts) {
+  block_nrows <- min(row_block_nrows, terra::nrow(grid_mask) - row_start + 1L)
+  block_mask_values <- terra::readValues(
+    grid_mask,
+    row = row_start,
+    nrows = block_nrows,
+    col = 1,
+    ncols = terra::ncol(grid_mask),
+    mat = FALSE
+  )
+
+  block_prediction <- rep(NA_real_, length(block_mask_values))
+  block_variance <- rep(NA_real_, length(block_mask_values))
+  active_offsets <- which(!is.na(block_mask_values))
+
+  if (length(active_offsets) > 0) {
+    chunk_starts <- seq.int(1L, length(active_offsets), by = kriging_batch_size)
+
+    for (chunk_start in chunk_starts) {
+      chunk_end <- min(chunk_start + kriging_batch_size - 1L, length(active_offsets))
+      chunk_offsets <- active_offsets[chunk_start:chunk_end]
+      global_cells <- ((row_start - 1L) * terra::ncol(grid_mask)) + chunk_offsets
+      chunk_xy <- terra::xyFromCell(grid_mask, global_cells)
+
+      chunk_sf <- st_as_sf(
+        data.frame(X = chunk_xy[, 1], Y = chunk_xy[, 2]),
+        coords = c("X", "Y"),
+        crs = st_crs(points_sf),
+        remove = FALSE
+      )
+      chunk_sp <- as(chunk_sf, "Spatial")
+
+      kriged_chunk <- krige(
+        formula = kriging_formula,
+        locations = points_sp,
+        newdata = chunk_sp,
+        model = selected_model,
+        nmax = kriging_nmax,
+        maxdist = fitted_range_m
+      )
+
+      block_prediction[chunk_offsets] <- kriged_chunk$var1.pred
+      block_variance[chunk_offsets] <- kriged_chunk$var1.var
+    }
+  }
+
+  terra::writeValues(pred_raster, block_prediction, row_start, block_nrows)
+  terra::writeValues(var_raster, block_variance, row_start, block_nrows)
+
+  finite_block_prediction <- block_prediction[is.finite(block_prediction)]
+  finite_block_variance <- block_variance[is.finite(block_variance)]
+
+  finite_prediction_cells <- finite_prediction_cells + length(finite_block_prediction)
+  finite_variance_cells <- finite_variance_cells + length(finite_block_variance)
+
+  if (length(finite_block_prediction) > 0) {
+    prediction_min <- min(prediction_min, min(finite_block_prediction))
+    prediction_max <- max(prediction_max, max(finite_block_prediction))
+  }
+
+  if (length(finite_block_variance) > 0) {
+    variance_min <- min(variance_min, min(finite_block_variance))
+    variance_max <- max(variance_max, max(finite_block_variance))
+  }
+}
+
+terra::readStop(grid_mask)
+terra::writeStop(pred_raster)
+terra::writeStop(var_raster)
+pred_raster <- terra::rast(pred_output_path)
+var_raster <- terra::rast(var_output_path)
+
+if (finite_prediction_cells == 0L) {
+  stop("Universal kriging produced no finite prediction values on the grid.", call. = FALSE)
+}
+
+if (finite_variance_cells == 0L) {
+  stop("Universal kriging produced no finite prediction variance values on the grid.", call. = FALSE)
+}
+
+prediction_summary <- data.frame(
+  metric = c(
+    "Predicted cells",
+    "Cells with finite variance",
+    "Prediction min",
+    "Prediction max",
+    "Variance min",
+    "Variance max"
+  ),
+  value = c(
+    format(finite_prediction_cells, big.mark = ","),
+    format(finite_variance_cells, big.mark = ","),
+    format(round(prediction_min, 4), big.mark = ","),
+    format(round(prediction_max, 4), big.mark = ","),
+    format(round(variance_min, 4), big.mark = ","),
+    format(round(variance_max, 4), big.mark = ",")
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(prediction_summary)
+```
+
+## Export Preview Maps
+
+```{r export-preview, out.width='100%'}
+preview_path <- file.path(output_dir, paste0(response_slug, "_uk_preview_", grid_resolution_label, "m.png"))
+save_base_preview(
+  pred_raster = pred_raster,
+  var_raster = var_raster,
+  boundary_vect = boundary_vect,
+  output_path = preview_path,
+  main_prefix = paste(response_field, "UK")
+)
+
+output_summary <- data.frame(
+  artifact = c(
+    "Fitted semivariogram figure",
+    "Directional semivariogram figure",
+    "Prediction raster",
+    "Variance raster",
+    "Prediction preview"
+  ),
+  path = c(
+    fit_plot_path,
+    directional_plot_path,
+    pred_output_path,
+    var_output_path,
+    preview_path
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(output_summary)
+knitr::include_graphics(preview_path)
+```
