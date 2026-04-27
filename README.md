@@ -2,9 +2,9 @@
 
 ## Overview
 
-The J-STARS project focuses on detecting and monitoring Rapid 'Ōhi'a Death (ROD) using satellite imagery and deep learning. The project employs a spatio-temporal deep learning approach combining Sentinel-1 SAR data with advanced temporal modeling to identify and track ROD outbreaks across the Hawaiian Archipelago.
+This project focuses on detecting and monitoring Rapid 'Ōhi'a Death (ROD) using satellite imagery and deep learning. The project employs a spatio-temporal deep learning approach combining Sentinel-1 SAR data with advanced temporal modeling to identify and track ROD outbreaks across the Hawaiian Archipelago.
 
-**Study Area:** DMSM flightlines
+**Study Area:** DMSM flight lines
 **Temporal Range:** 6-year longitudinal dataset (2016-2021)
 **Output Classes:** 2 classes (healthy forest, ROD mortality)
 
