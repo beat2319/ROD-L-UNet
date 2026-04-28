@@ -4,9 +4,9 @@
 
 This project focuses on detecting and monitoring Rapid 'Ōhi'a Death (ROD) using satellite imagery and deep learning. The project employs a spatio-temporal deep learning approach combining Sentinel-1 SAR data with advanced temporal modeling to identify and track ROD outbreaks across the Hawaiian Archipelago.
 
-**Study Area:** DMSM flight lines
-**Temporal Range:** 6-year longitudinal dataset (2016-2021)
-**Output Classes:** 2 classes (healthy forest, ROD mortality)
+- **Study Area:** DMSM flight lines
+- **Temporal Range:** 6-year longitudinal dataset (2016-2021)
+- **Output Classes:** 2 classes (healthy forest, ROD mortality)
 
 ---
 
@@ -16,14 +16,14 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 
 ### Geographic Bias
 
-- ![Flightline Coverage](Images/flightline_visualization.png)
+![Flightline Coverage](Images/flightline_visualization.png)
 - Visibility-constrained mapping creates systemic geographic bias
 - Flight line buffer limited to 1 mile (up to 2 miles with good visibility)
 - Areas outside surveyors' field of view remain unsampled ("geographic information desert")
 
 ### Subjective Boundaries
 
-- ![Aerial Survey Methodology](Images/aerial_survey.svg)
+![Aerial Survey Methodology](Images/aerial_survey.svg)
 - No standardized protocol for polygon boundaries
 - "No specified rule regarding how far digitized polygons were from target trees"
 - Freeform polygons drawn to "best of analysts' ability"
@@ -33,7 +33,7 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 
 ### Temporal Limitations
 
-- ![Aerial Survey Methodology](Images/DMSM_Surveys.png)
+![Aerial Survey Methodology](Images/DMSM_Surveys.png)
 - Limited annual flightline counts per island
 
 ### Key Citation
