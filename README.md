@@ -220,7 +220,7 @@ class S1ChangeDetector:
 ### Negative Sample Logic
 
 Negative samples constrained using NLCD TCC with 10% threshold to ensure model distinguishes ROD from healthy forest rather than non-forested land.
-![negative_pipeline](Images/negative-pipeline.svg)
+![negative_pipeline](Images/Negative-Pipeline.svg)
 
 ---
 
