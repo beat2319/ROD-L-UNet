@@ -17,6 +17,7 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 ### Geographic Bias
 
 ![Flightline Coverage](Images/flightline_visualization.png)
+
 - Visibility-constrained mapping creates systemic geographic bias
 - Flight line buffer limited to 1 mile (up to 2 miles with good visibility)
 - Areas outside surveyors' field of view remain unsampled ("geographic information desert")
@@ -24,6 +25,7 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 ### Subjective Boundaries
 
 ![Aerial Survey Methodology](Images/aerial_survey.svg)
+
 - No standardized protocol for polygon boundaries
 - "No specified rule regarding how far digitized polygons were from target trees"
 - Freeform polygons drawn to "best of analysts' ability"
@@ -34,6 +36,7 @@ Current ROD surveillance relies on **Digital Mobile Sketch Mapping (DMSM)** aeri
 ### Temporal Limitations
 
 ![Aerial Survey Methodology](Images/DMSM_Surveys.png)
+
 - Limited annual flightline counts per island
 
 ### Key Citation
@@ -219,7 +222,7 @@ class S1ChangeDetector:
 
 ### Negative Sample Logic
 
-Negative samples constrained using NLCD TCC with 10% threshold to ensure model distinguishes ROD from healthy forest rather than non-forested land.
+Negative samples constrained using NLCD TCC with 10% threshold to ensure model distinguishes ROD from healthy forest rather than non-forested land
 ![negative_pipeline](Images/Negative-Pipeline.svg)
 
 ---
@@ -301,7 +304,7 @@ loss = focal_weight * FocalLoss + dice_weight * DiceLoss
 ### Optimizer and Scheduler
 
 - **Optimizer:** AdamW (weight decay 1e-2)
-	- [SAM](https://github.com/davda54/sam) also recommended 
+  - [SAM](https://github.com/davda54/sam) also recommended
 - **Scheduler:** CosineAnnealingLR (decays from initial LR to 0)
 - **Freeze Schedule:** Lower encoder layers frozen for first N epochs
 
