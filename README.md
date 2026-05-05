@@ -220,6 +220,7 @@ class S1ChangeDetector:
 ### Negative Sample Logic
 
 Negative samples constrained using NLCD TCC with 10% threshold to ensure model distinguishes ROD from healthy forest rather than non-forested land.
+![negative_pipeline](Images/negative-pipeline.svg)
 
 ---
 
@@ -300,6 +301,7 @@ loss = focal_weight * FocalLoss + dice_weight * DiceLoss
 ### Optimizer and Scheduler
 
 - **Optimizer:** AdamW (weight decay 1e-2)
+	- [SAM](https://github.com/davda54/sam) also recommended 
 - **Scheduler:** CosineAnnealingLR (decays from initial LR to 0)
 - **Freeze Schedule:** Lower encoder layers frozen for first N epochs
 
@@ -482,3 +484,14 @@ This project builds upon foundational work in remote sensing of forest health an
 - Copernicus Sentinel program for open SAR data
 - SSL4EO-S12 for pretraining weights
 - The Hawaiian forest conservation community for ground truth verification
+
+---
+
+## Related Notes (Semantic Connections)
+
+These notes are highly connected through their focus on ROD detection, remote sensing methods, and deep learning:
+
+- [[Documentation/Study Area and Data Acquisition.md]] - Study area details and Sentinel-1 SAR data acquisition
+- [[../../../Holding/ROD-ML/stage_1/paper/Pre Input.md]] - Detailed preprocessing and model architecture for ROD detection
+- [[../../../Areas/University/Semester_1/GEOG_4003/Mini Topics/SatClip.md]] - Location embedding methods for satellite imagery
+- [[../../../Areas/University/Semester_2/WRTG_3035/Remote Sensing Methods for Capturing the Spread Of ROD.md]] - Comprehensive analysis of ROD monitoring approaches
