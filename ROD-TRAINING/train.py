@@ -19,9 +19,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
+from sam import SAM
 
 from dataset import S1ChangeDataset
-from losses import CombinedCrossEntropyDiceLoss, CombinedFocalDiceLoss
+from losses import SmoothedCrossEntropyLoss, FocalLoss
 from metrics import ChangeDetectionMetrics
 from models import S1ChangeDetector
 
@@ -59,6 +60,42 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
+class enable_running_stats(nn.Module):
+    """Context manager to enable BN running stats updates during the forward pass."""
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def __enter__(self):
+        for m in self.model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.backup_momentum = m.momentum
+                m.momentum = m.backup_momentum  # restore original momentum
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+class disable_running_stats(nn.Module):
+    """Context manager to disable BN running stats updates during the forward pass."""
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.model = model
+
+    def __enter__(self):
+        for m in self.model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.backup_momentum = m.momentum
+                m.momentum = 0  # freeze running stats
+        return self
+
+    def __exit__(self, *args):
+        for m in self.model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.momentum = m.backup_momentum  # restore original momentum
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -78,14 +115,44 @@ def train_one_epoch(
         mask = mask.to(device)
         doy = doy.to(device)
 
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
 
-        with torch.amp.autocast("cuda"):
+        # with torch.amp.autocast("cuda"):
+        #     logits = model(chip, doy)
+        #     loss = criterion(logits, mask)
+
+        # scaler.scale(loss).backward()
+        # scaler.step(optimizer)
+        # scaler.update()
+
+        # Step 1: Standard forward and backward pass (BN stats enabled)
+        with enable_running_stats(model), torch.amp.autocast("cuda"):
             logits = model(chip, doy)
             loss = criterion(logits, mask)
 
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
+
+        # Unscale before SAM modifies weights, so the grad norm isn't artificially large
+        scaler.unscale_(optimizer.base_optimizer)
+
+        # Move weights to the local maximum: w + e(w)
+        optimizer.first_step(zero_grad=True)
+
+        # Step 2: Second forward and backward pass (BN stats disabled)
+        with disable_running_stats(model), torch.amp.autocast("cuda"):
+            logits_adv = model(chip, doy)
+            # Evaluate the loss at the sharpest point in the neighborhood
+            loss_adv = criterion(logits_adv, mask)
+
+        scaler.scale(loss_adv).backward()
+
+        # Unscale the second backward pass before base_optimizer.step()
+        # Uses optimizer (SAM) instead of optimizer.base_optimizer so the scaler
+        # tracks a different optimizer ID and doesn't raise "already unscaled".
+        scaler.unscale_(optimizer)
+
+        # Return weights to w, then apply the base optimizer step using the adversarial gradient
+        optimizer.second_step(zero_grad=True)
         scaler.update()
 
         total_loss += loss.item()
@@ -157,19 +224,13 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--alpha", type=float, nargs="+", default=[1.0, 2.0],
                         help="Class weights for loss [healthy, mortality]")
-    parser.add_argument("--loss", type=str, default="ce_dice",
-                        choices=["ce_dice", "focal_dice"],
+    parser.add_argument("--loss", type=str, default="ce",
+                        choices=["ce", "focal"],
                         help="Segmentation loss to optimize")
     parser.add_argument("--label-smoothing", type=float, default=0.05,
                         help="Label smoothing for cross-entropy")
-    parser.add_argument("--ce-weight", type=float, default=1.0,
-                        help="Weight for cross-entropy component")
-    parser.add_argument("--focal-weight", type=float, default=1.0,
-                        help="Weight for focal component")
     parser.add_argument("--focal-gamma", type=float, default=2.0,
                         help="Focal focusing parameter")
-    parser.add_argument("--dice-weight", type=float, default=0.5,
-                        help="Weight for Dice component")
     parser.add_argument("--temporal-encoding-dim", type=int, default=32,
                         help="Day-of-year encoding dimension (0 disables)")
     parser.add_argument("--temporal-dropout", type=float, default=0.2,
@@ -197,11 +258,6 @@ def main():
             "WARNING: --augment-change-threshold is deprecated and ignored. "
             "Heavy augmentation now applies to every training patch."
         )
-    if args.loss == "focal_dice" and args.label_smoothing != 0.05:
-        print(
-            "WARNING: --label-smoothing is ignored when using --loss focal_dice."
-        )
-
     set_seed(args.seed)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -256,22 +312,16 @@ def main():
     print(f"Parameters: {total_params:,} total, {trainable_params:,} trainable")
 
     # Loss
-    if args.loss == "focal_dice":
-        criterion = CombinedFocalDiceLoss(
-            num_classes=2,
+    if args.loss == "focal":
+        criterion = FocalLoss(
             alpha=args.alpha,
             gamma=args.focal_gamma,
-            focal_weight=args.focal_weight,
-            dice_weight=args.dice_weight,
             ignore_index=255,
         )
     else:
-        criterion = CombinedCrossEntropyDiceLoss(
-            num_classes=2,
+        criterion = SmoothedCrossEntropyLoss(
             alpha=args.alpha,
             label_smoothing=args.label_smoothing,
-            ce_weight=args.ce_weight,
-            dice_weight=args.dice_weight,
             ignore_index=255,
         )
     print(f"Loss: {args.loss}")
@@ -287,15 +337,19 @@ def main():
         ):
             encoder_spatial_low_params.append(param)
 
-    optimizer = optim.AdamW(
+    base_optimizer = optim.AdamW
+    optimizer = SAM(
         model.parameters(),
+        base_optimizer,
+        rho=0.05,           
+        adaptive=False,     
         lr=args.lr,
         weight_decay=1e-2,
     )
 
     # Decay from the configured starting rates instead of ramping upward.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
+        optimizer.base_optimizer,
         T_max=args.epochs,
         eta_min=0.0,
     )

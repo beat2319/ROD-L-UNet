@@ -221,9 +221,10 @@ class S1ChangeDetector:
 - **Balance:** 3:1 positive (ROD) to negative (healthy) ratio
 
 ### Negative Sample Logic
+![negative_pipeline](Images/negative_pipeline.svg)
 
-Negative samples constrained using NLCD TCC with 10% threshold to ensure model distinguishes ROD from healthy forest rather than non-forested land
-![negative_pipeline](Images/Negative-Pipeline.svg)
+### Positive Sample Logic
+![positive_pipeline](Images/positive_pipeline.svg)
 
 ---
 
@@ -489,12 +490,3 @@ This project builds upon foundational work in remote sensing of forest health an
 - The Hawaiian forest conservation community for ground truth verification
 
 ---
-
-## Related Notes (Semantic Connections)
-
-These notes are highly connected through their focus on ROD detection, remote sensing methods, and deep learning:
-
-- [[Documentation/Study Area and Data Acquisition.md]] - Study area details and Sentinel-1 SAR data acquisition
-- [[../../../Holding/ROD-ML/stage_1/paper/Pre Input.md]] - Detailed preprocessing and model architecture for ROD detection
-- [[../../../Areas/University/Semester_1/GEOG_4003/Mini Topics/SatClip.md]] - Location embedding methods for satellite imagery
-- [[../../../Areas/University/Semester_2/WRTG_3035/Remote Sensing Methods for Capturing the Spread Of ROD.md]] - Comprehensive analysis of ROD monitoring approaches

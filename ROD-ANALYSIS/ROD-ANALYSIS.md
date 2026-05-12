@@ -1,3 +1,5 @@
-[[Geographically Weighted Regression (GWR)]]
-[[Spatial Dependency Analysis with DMSM]]
-[[Semivariance with GAO]]
+- [[Geographically Weighted Regression (GWR)]]
+- [[Spatial Dependency Analysis with DMSM]]
+- [[Semivariance with GAO]]
+- [[adv quant methods]]
+[[../J-STARS]]
