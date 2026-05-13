@@ -224,7 +224,7 @@ class S1ChangeDetector:
 ![negative_pipeline](Images/negative_pipeline.svg)
 
 ### Positive Sample Logic
-![positive_pipeline](Images/positive_pipeline.svg)
+![positive_pipeline](Images/postive_pipeline.svg)
 
 ---
 

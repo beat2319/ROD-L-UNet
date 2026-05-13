@@ -237,7 +237,7 @@ def main():
                         help="Dropout applied around temporal feature aggregation")
     parser.add_argument("--decoder-dropout", type=float, default=0.2,
                         help="Dropout applied inside decoder blocks")
-    parser.add_argument("--early-stopping-patience", type=int, default=2,
+    parser.add_argument("--early-stopping-patience", type=int, default=10,
                         help="Stop if val mortality IoU fails to improve for this many epochs")
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4,
                         help="Minimum val mortality IoU gain to reset early stopping")
